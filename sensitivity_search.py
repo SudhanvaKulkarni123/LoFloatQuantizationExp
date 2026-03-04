@@ -5,27 +5,162 @@ from LoFloat import LoF_Linear, LoF_Conv2d
 import copy
 import math
 import sensitivities
+import gptq
 
 
-def bisetion_sensitivity(model, sensitivity_measure, data, n_samples=256, device='cpu'):
+def bisection_sensitivity(model, sensitivity_measure, data, loss_fn, eval_fn,
+                          accuracy_target, bs=[8, 6, 4], n_samples=256, device='cuda'):
 
     lof_model = lof.lofloatify(model)
+    lof_model.to(device)
     weights_minmax, activ_minmax, bias_minmax = sensitivities.find_range(lof_model, data, n_samples, device)
-    weights_exp, weights_bias, activ_exp, activ_bias, bias_exp, bias_bias = sensitivities.find_exp_bits_and_bias(weights_minmax, activ_minmax)
+    print("Ranges found for weights, activations, and biases. Starting exponent search...")
+    weights_exp, weights_bias, activ_exp, activ_bias, bias_exp, bias_bias = sensitivities.find_exp_bits_and_bias(weights_minmax, activ_minmax, bias_minmax)
     lof.set_exponent_fields(model=lof_model, activation_exp_bits=activ_exp, weight_exp_bits=weights_exp, bias_exp_bits=bias_exp)
-    lof.set_bias_fields(model=lof_model, activation_bias=activ_bias, weight_bias=weights_bias, bias_bias=bias_bias)
+    #lof.set_exponentbias_fields(model=lof_model, activation_expbias=activ_bias, weight_expbias=weights_bias, bias_expbias=bias_bias)
 
-    #exponent search done, now search over mantissa
+    # exponent search done, now search over mantissa
     if sensitivity_measure == "hessian":
-        
+        weight_sens, activ_sens, bias_sens = sensitivities.hess_sensitivity(lof_model, data, n_samples, device)
+    else:
+        weight_sens, activ_sens, bias_sens = sensitivities.noise_sensitivity_full(lof_model, data, loss_fn, n_samples, device)
 
-    sorted_data_asc = dict(sorted(data.items(), key=lambda item: item[1]))
+    # Sort layers by weight sensitivity ascending (least sensitive first)
+    ll = [k for k, v in sorted(weight_sens.items(), key=lambda item: next(iter(item[1].values())))]
 
+    # Initialize working config w with mantissa=11 for all layers
+    w_weights = {layer: 11 for layer in ll}
+    w_activ   = {layer: 11 for layer in ll}
+    w_bias    = {layer: 11 for layer in ll}
 
+    for b in bs:
+        thr  = len(ll) // 2
+        upl  = len(ll)
+        lowl = 0
 
+        count = 0
+        prev_thr = None
+        while thr != prev_thr:
+            count = count + 1
+            prev_thr = thr
 
-    return
+            # Local working config: copy w, then assign b to first thr layers
+            lw_weights = dict(w_weights)
+            lw_activ   = dict(w_activ)
+            lw_bias    = dict(w_bias)
 
+            for layer in ll[:thr]:
+                lw_weights[layer] = b
+                lw_activ[layer]   = b
+                lw_bias[layer]    = b
 
-def greedy_sensitivity():
-    return
+            # Apply local config and evaluate accuracy
+            lof.set_mantissa_fields(model=lof_model,
+                                    activation_mantissa_bits=lw_activ,
+                                    weight_mantissa_bits=lw_weights,
+                                    bias_mantissa_bits=lw_bias)
+            gptq.gptq(model=lof_model, data=data, n_samples=n_samples, device=device, actorder=False, groupsize=-1, static_groups=False)
+            a = eval_fn(lof_model, data)
+
+            print("at iter {} with b={} and thr={}: accuracy = {:.4f}, target = {:.4f}".format(count, b, thr, a, accuracy_target))
+
+            if abs(a) <= accuracy_target:
+                lowl = thr
+                thr  = thr + (upl - thr) // 2   # push threshold up
+            else:
+                upl  = thr
+                thr  = thr - (thr - lowl) // 2  # pull threshold down
+
+        # Commit the converged threshold to the working config
+        for layer in ll[:thr]:
+            w_weights[layer] = b
+            w_activ[layer]   = b
+            w_bias[layer]    = b
+
+        # Shrink ll: only layers already quantized are candidates for next round
+        ll = ll[:thr]
+
+    # Apply the final optimal configuration to the model
+    lof.set_mantissa_fields(model=lof_model,
+                            activation_mantissa_bits=w_activ,
+                            weight_mantissa_bits=w_weights,
+                            bias_mantissa_bits=w_bias)
+    lof.set_exponent_fields(model=lof_model, activation_exp_bits=activ_exp, weight_exp_bits=weights_exp, bias_exp_bits=bias_exp)
+    print("Optimal mantissa bits found for all layers. Final configuration applied to model.")
+    lof.print_exp_mant(lof_model)
+
+    return lof_model
+
+def greedy_sensitivity(model, sensitivity_measure, data, loss_fn, eval_fn,
+                       accuracy_target, bs=[8, 6, 4], n_samples=256, device='cuda'):
+    lof_model = lof.lofloatify(model)
+    lof_model.to(device)
+
+    weights_minmax, activ_minmax, bias_minmax = sensitivities.find_range(lof_model, data, n_samples, device)
+    print("Ranges found for weights, activations, and biases. Starting exponent search...")
+    weights_exp, weights_bias, activ_exp, activ_bias, bias_exp, bias_bias = sensitivities.find_exp_bits_and_bias(weights_minmax, activ_minmax, bias_minmax)
+    lof.set_exponent_fields(model=lof_model, activation_exp_bits=activ_exp, weight_exp_bits=weights_exp, bias_exp_bits=bias_exp)
+
+    # Sensitivity analysis
+    if sensitivity_measure == "hessian":
+        weight_sens, activ_sens, bias_sens = sensitivities.hess_sensitivity(lof_model, data, n_samples, device)
+    else:
+        weight_sens, activ_sens, bias_sens = sensitivities.noise_sensitivity_full(lof_model, data, loss_fn, n_samples, device)
+
+    # Sort layers by weight sensitivity ascending (least sensitive = quantize first)
+    ll = [k for k, v in sorted(weight_sens.items(), key=lambda item: next(iter(item[1].values())))]
+
+    # Initialize working config w with max(bs) mantissa bits
+    max_b = max(bs)
+    w_weights = {layer: max_b for layer in ll}
+    w_activ   = {layer: max_b for layer in ll}
+    w_bias    = {layer: max_b for layer in ll}
+
+    # Sort bit widths descending (try most aggressive quantization first)
+    bs = sorted(bs, reverse=True)
+
+    for b in bs:
+        ql = []  # layers that survived this round
+
+        for layer in ll:
+            # Try setting this layer to bit width b
+            prev_w = w_weights[layer]
+            prev_a = w_activ[layer]
+            prev_b = w_bias[layer]
+
+            w_weights[layer] = b
+            w_activ[layer]   = b
+            w_bias[layer]    = b
+
+            lof.set_mantissa_fields(model=lof_model,
+                                    activation_mantissa_bits=w_activ,
+                                    weight_mantissa_bits=w_weights,
+                                    bias_mantissa_bits=w_bias)
+            
+
+            a = eval_fn(lof_model, data)
+            print(f"Greedy b={b}, layer={layer}: accuracy = {a:.4f}, target = {accuracy_target:.4f}")
+
+            if a >= accuracy_target:
+                # Keep this quantization, layer is a candidate for next round
+                ql.append(layer)
+            else:
+                # Revert
+                w_weights[layer] = prev_w
+                w_activ[layer]   = prev_a
+                w_bias[layer]    = prev_b
+
+        # Only layers that accepted this bit width are candidates for the next
+        ll = ql
+
+    # Apply final config
+    lof.set_mantissa_fields(model=lof_model,
+                            activation_mantissa_bits=w_activ,
+                            weight_mantissa_bits=w_weights,
+                            bias_mantissa_bits=w_bias)
+    lof.set_exponent_fields(model=lof_model, activation_exp_bits=activ_exp, weight_exp_bits=weights_exp, bias_exp_bits=bias_exp)
+
+    print("Greedy search complete. Final configuration applied.")
+    lof.print_exp_mant(lof_model)
+
+    return lof_model

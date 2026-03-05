@@ -9,12 +9,11 @@ import gptq
 
 
 def bisection_sensitivity(model, sensitivity_measure, data, loss_fn, eval_fn,
-                          accuracy_target, bs=[8, 6, 4], n_samples=256, device='cuda'):
+                          accuracy_target, bs=[8, 6, 4], n_samples=256, use_gptq=True, device='cuda'):
 
     lof_model = lof.lofloatify(model)
     lof_model.to(device)
     weights_minmax, activ_minmax, bias_minmax = sensitivities.find_range(lof_model, data, n_samples, device)
-    print("Ranges found for weights, activations, and biases. Starting exponent search...")
     weights_exp, weights_bias, activ_exp, activ_bias, bias_exp, bias_bias = sensitivities.find_exp_bits_and_bias(weights_minmax, activ_minmax, bias_minmax)
     lof.set_exponent_fields(model=lof_model, activation_exp_bits=activ_exp, weight_exp_bits=weights_exp, bias_exp_bits=bias_exp)
     #lof.set_exponentbias_fields(model=lof_model, activation_expbias=activ_bias, weight_expbias=weights_bias, bias_expbias=bias_bias)
@@ -55,14 +54,15 @@ def bisection_sensitivity(model, sensitivity_measure, data, loss_fn, eval_fn,
                 lw_bias[layer]    = b
 
             # Apply local config and evaluate accuracy
+            # lof.set_mantissa_fields(model=lof_model,
+            #                         activation_mantissa_bits=lw_activ,
+            #                         weight_mantissa_bits=lw_weights,
+            #                         bias_mantissa_bits=lw_bias)
             lof.set_mantissa_fields(model=lof_model,
                                     activation_mantissa_bits=lw_activ,
                                     weight_mantissa_bits=lw_weights,
                                     bias_mantissa_bits=lw_bias)
-            gptq.gptq(model=lof_model, data=data, n_samples=n_samples, device=device, actorder=False, groupsize=-1, static_groups=False)
             a = eval_fn(lof_model, data)
-
-            print("at iter {} with b={} and thr={}: accuracy = {:.4f}, target = {:.4f}".format(count, b, thr, a, accuracy_target))
 
             if abs(a) <= accuracy_target:
                 lowl = thr
@@ -81,23 +81,21 @@ def bisection_sensitivity(model, sensitivity_measure, data, loss_fn, eval_fn,
         ll = ll[:thr]
 
     # Apply the final optimal configuration to the model
+    sensitivities.quantize_weights_with_gptq(model=lof_model, dataset=data, mantissa_bits=w_weights, exponent_bits=weights_exp, n_samples=n_samples, device=device)
     lof.set_mantissa_fields(model=lof_model,
                             activation_mantissa_bits=w_activ,
                             weight_mantissa_bits=w_weights,
                             bias_mantissa_bits=w_bias)
     lof.set_exponent_fields(model=lof_model, activation_exp_bits=activ_exp, weight_exp_bits=weights_exp, bias_exp_bits=bias_exp)
-    print("Optimal mantissa bits found for all layers. Final configuration applied to model.")
-    lof.print_exp_mant(lof_model)
 
     return lof_model
 
 def greedy_sensitivity(model, sensitivity_measure, data, loss_fn, eval_fn,
-                       accuracy_target, bs=[8, 6, 4], n_samples=256, device='cuda'):
+                       accuracy_target, bs=[8, 6, 4], n_samples=128, device='cuda'):
     lof_model = lof.lofloatify(model)
     lof_model.to(device)
 
     weights_minmax, activ_minmax, bias_minmax = sensitivities.find_range(lof_model, data, n_samples, device)
-    print("Ranges found for weights, activations, and biases. Starting exponent search...")
     weights_exp, weights_bias, activ_exp, activ_bias, bias_exp, bias_bias = sensitivities.find_exp_bits_and_bias(weights_minmax, activ_minmax, bias_minmax)
     lof.set_exponent_fields(model=lof_model, activation_exp_bits=activ_exp, weight_exp_bits=weights_exp, bias_exp_bits=bias_exp)
 
@@ -138,11 +136,9 @@ def greedy_sensitivity(model, sensitivity_measure, data, loss_fn, eval_fn,
                                     bias_mantissa_bits=w_bias)
             
 
-            a = eval_fn(lof_model, data)
-            print(f"Greedy b={b}, layer={layer}: accuracy = {a:.4f}, target = {accuracy_target:.4f}")
+            a = abs(eval_fn(lof_model, data))
 
-            if a >= accuracy_target:
-                # Keep this quantization, layer is a candidate for next round
+            if a <= accuracy_target:
                 ql.append(layer)
             else:
                 # Revert
@@ -154,6 +150,7 @@ def greedy_sensitivity(model, sensitivity_measure, data, loss_fn, eval_fn,
         ll = ql
 
     # Apply final config
+    sensitivities.quantize_weights_with_gptq(model=lof_model, dataset=data, mantissa_bits=w_weights, exponent_bits=weights_exp, n_samples=128, device=device)
     lof.set_mantissa_fields(model=lof_model,
                             activation_mantissa_bits=w_activ,
                             weight_mantissa_bits=w_weights,
@@ -161,6 +158,5 @@ def greedy_sensitivity(model, sensitivity_measure, data, loss_fn, eval_fn,
     lof.set_exponent_fields(model=lof_model, activation_exp_bits=activ_exp, weight_exp_bits=weights_exp, bias_exp_bits=bias_exp)
 
     print("Greedy search complete. Final configuration applied.")
-    lof.print_exp_mant(lof_model)
 
     return lof_model

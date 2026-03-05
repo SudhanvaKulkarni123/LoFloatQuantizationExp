@@ -726,7 +726,7 @@ def run_ultralytics_quantized(model_key, data_yaml, calib_img_path, device):
         eval_fn=eval_fn,
         accuracy_target=accuracy_target,
         bs=[6, 5, 4, 3, 2],
-        n_samples=64,
+        n_samples=128,
         device=device,
     )
 
@@ -846,6 +846,8 @@ def run_torchvision_quantized(model_key, dataset_name, device):
         n_samples=n_calib,
         device=device,
     )
+
+    print(lof.record_formats(quantized_model))
 
     # Full eval on quantized model
     if dataset_name == "coco":

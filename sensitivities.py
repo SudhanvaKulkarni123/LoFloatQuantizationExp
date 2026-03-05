@@ -292,7 +292,7 @@ def noise_sensitivity_full(model, dataset, loss_fn, n_samples=256, device='cpu')
     with torch.no_grad():
         baseline_loss = loss_fn(model(calib_data)).item()
 
-    captured_activations = {}
+    captured_activation = {}
     def make_capture_hook(layer_name):
         def hook(module, input, output):
             captured_activations[layer_name] = input[0].detach()
@@ -351,6 +351,106 @@ def noise_sensitivity_full(model, dataset, loss_fn, n_samples=256, device='cpu')
 
     return weight_sensitivity, activation_sensitivity, bias_sensitivity  
 
+
+#works by using forward hook to collect data at the layer, for XX^t and perform Cholesky decomp. Then we use GPTQ to update the weight and continue with the forward pass
+def quantize_weights_with_gptq(model, dataset, exponent_bits, mantissa_bits, n_samples=256, device='cpu', perturb_ratio=0.01):
+    model.eval()
+    model.to(device)
+    calib_data, _ = make_calib_data(dataset=dataset, n_samples=n_samples)
+    calib_data = calib_data.to(device)
+    captured_activations = {}
+    captured_pre_choleskys = {}
+    blocksize = n_samples
+
+    def make_capture_hook(layer_name):
+        def hook(module, input):
+            if isinstance(module, LoF_Conv2d) and module.groups > 1:
+                W = module.weight.data.clone()
+                exp_bits = exponent_bits[layer_name]
+                mant_bits = mantissa_bits[layer_name]
+                Q = lof.exp_mant_quantize(W, exp_bits, mant_bits)
+                module.weight.data.copy_(Q)
+                return
+
+            X = input[0].detach()
+            if X.ndim == 3:
+                X = X.reshape(-1, X.shape[-1])
+            elif X.ndim == 4:
+                X = torch.nn.functional.unfold(
+                    X,
+                    kernel_size=module.kernel_size,
+                    stride=module.stride,
+                    padding=module.padding,
+                    dilation=module.dilation,
+                )
+                X = X.permute(0, 2, 1).reshape(-1, X.shape[1])
+            captured_activations[layer_name] = X
+            nsamples = X.shape[0]
+            H = (X.t() @ X) / nsamples
+            damp = perturb_ratio * torch.diag(H).mean()
+            H += damp * torch.eye(H.shape[0], device=H.device)
+            perm = torch.argsort(torch.diag(H), descending=True)
+            invperm = torch.argsort(perm)
+            W = module.weight.data.clone()
+            orig_shape = W.shape
+            if W.ndim == 4:
+                W = W.reshape(W.shape[0], -1)
+            columns = W.shape[1]
+            W = W[:, perm]
+            H = H[perm][:, perm]
+            cho = torch.linalg.cholesky(H)
+            H_inv = torch.cholesky_inverse(cho)
+            Hinv = torch.linalg.cholesky(H_inv, upper=True)
+            Q = torch.zeros_like(W)
+            exp_bits = exponent_bits[layer_name]
+            mant_bits = mantissa_bits[layer_name]
+            for i1 in range(0, columns, blocksize):
+                i2 = min(i1 + blocksize, columns)
+                count = i2 - i1
+                W_block = W[:, i1:i2].clone()
+                Q_block = torch.zeros_like(W_block)
+                Err_block = torch.zeros_like(W_block)
+                Hinv_block = Hinv[i1:i2, i1:i2]
+                for j in range(count):
+                    q = lof.exp_mant_quantize(W_block[:, j], exp_bits, mant_bits)
+                    Q_block[:, j] = q
+                    err = (W_block[:, j] - q) / Hinv_block[j, j]
+                    Err_block[:, j] = err
+                    if j + 1 < count:
+                        W_block[:, j + 1:] -= err.unsqueeze(1) * Hinv_block[j, j + 1:].unsqueeze(0)
+                Q[:, i1:i2] = Q_block
+                if i2 < columns:
+                    W[:, i2:] -= Err_block @ Hinv[i1:i2, i2:]
+            Q = Q[:, invperm]
+            if len(orig_shape) == 4:
+                Q = Q.reshape(orig_shape)
+            module.weight.data.copy_(Q)
+        return hook
+
+    def delete_activation_hook(layer_name):
+        def hook(module, input, output):
+            captured_activations.pop(layer_name, None)
+            captured_pre_choleskys.pop(layer_name, None)
+        return hook
+
+    capture_pre_hooks = [
+        module.register_forward_pre_hook(make_capture_hook(name))
+        for name, module in model.named_modules()
+        if isinstance(module, (LoF_Linear, LoF_Conv2d))
+    ]
+    capture_post_hooks = [
+        module.register_forward_hook(delete_activation_hook(name))
+        for name, module in model.named_modules()
+        if isinstance(module, (LoF_Linear, LoF_Conv2d))
+    ]
+    with torch.no_grad():
+        model(calib_data)
+    for h in capture_pre_hooks:
+        h.remove()
+    for h in capture_post_hooks:
+        h.remove()
+
+    return model
 
 
 

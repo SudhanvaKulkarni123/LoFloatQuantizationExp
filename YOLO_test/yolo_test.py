@@ -48,12 +48,13 @@ logging.getLogger("ultralytics").setLevel(logging.WARNING)
 sys.path.append("..")
 try:
     import LoFloat as lof
-    import sensitivity_search as ss
     HAS_LOFLOAT = True
 except ImportError:
     HAS_LOFLOAT = False
     print("[WARN] LoFloat / sensitivity_search not found — "
           "quantization steps will be skipped, only FP baselines will run.")
+
+import sensitivity_search as ss
 
 # ===================================================================
 #  GLOBAL CONFIG (overridden by CLI)
@@ -164,7 +165,7 @@ COCO_CLASS_NAMES = [
 
 def prepare_coco():
     images_dir = os.path.join(COCO_ROOT, "images")
-    annot_dir  = os.path.join(COCO_ROOT, "annotations", "annotations")
+    annot_dir  = os.path.join(COCO_ROOT, "annotations", "annotations", "annotations")
 
     for name, url in COCO_URLS.items():
         target_dir = annot_dir if name == "annotations" else images_dir
@@ -212,7 +213,7 @@ PASCAL_CLASS_NAMES = [
 def _convert_voc_to_yolo(voc_root):
     import xml.etree.ElementTree as ET
     img_dir   = os.path.join(voc_root, "JPEGImages")
-    annot_dir = os.path.join(voc_root, "Annotations")
+    annot_dir = os.path.join(voc_root, "Annotations/annotations")
     label_dir = os.path.join(voc_root, "labels", "val")
     os.makedirs(label_dir, exist_ok=True)
     cls_to_idx = {c: i for i, c in enumerate(PASCAL_CLASS_NAMES)}
@@ -326,6 +327,38 @@ class CalibDataset(Dataset):
         return img, label
 
 
+def cosine_distance_chunked(a, b, chunk=1 << 20, eps=1e-8):
+    """1 - cos_sim(a, b) without allocating full-size temporaries.
+
+    Autograd-friendly: gradients flow through `a` and `b` if they require grad,
+    which is required when this is used as a loss_fn inside sensitivity search
+    (greedy_sensitivity + hessian measure needs ∇loss w.r.t. model params).
+    For grad-free usage (e.g. `.item()` prints), wrap the call in torch.no_grad().
+
+    Float64 accumulators avoid precision loss when summing millions of products.
+    """
+    a = a.reshape(-1)
+    b = b.reshape(-1)
+    n = min(a.numel(), b.numel())
+    a = a[:n]
+    b = b[:n]
+
+    dot = a.new_zeros((), dtype=torch.float64)
+    aa  = a.new_zeros((), dtype=torch.float64)
+    bb  = a.new_zeros((), dtype=torch.float64)
+
+    for i in range(0, n, chunk):
+        ac = a[i:i+chunk].double()
+        bc = b[i:i+chunk].double()
+        dot = dot + (ac * bc).sum()
+        aa  = aa  + (ac * ac).sum()
+        bb  = bb  + (bc * bc).sum()
+
+    denom = (aa.sqrt() * bb.sqrt()).clamp_min(eps)
+    out_dtype = a.dtype if a.is_floating_point() else torch.float32
+    return (1.0 - dot / denom).to(out_dtype)
+
+
 # ===================================================================
 #  TORCHVISION EVAL HELPERS
 # ===================================================================
@@ -343,7 +376,7 @@ def _build_torchvision_dataloader(dataset_name, batch_size):
     transform = RGBToTensor()
     if dataset_name == "coco":
         img_dir = os.path.join(COCO_ROOT, "images", "val2017")
-        ann_file = os.path.join(COCO_ROOT, "annotations", "annotations", "instances_val2017.json")
+        ann_file = os.path.join(COCO_ROOT, "annotations", "annotations", "annotations", "instances_val2017.json")
         ds = CocoDetection(img_dir, ann_file, transform=transform)
         coco_gt = _get_coco_gt(ann_file)
         info = dict(name="coco", nc=80)
@@ -628,7 +661,7 @@ def eval_deimv2_coco(model, device, batch_size=16, target_size=640):
     from pycocotools.cocoeval import COCOeval
     from torchvision.datasets import CocoDetection
     img_dir = os.path.join(COCO_ROOT, "images", "val2017")
-    ann_file = os.path.join(COCO_ROOT, "annotations", "annotations", "instances_val2017.json")
+    ann_file = os.path.join(COCO_ROOT, "annotations", "annotations","annotations" ,"instances_val2017.json")
     coco_gt = _get_coco_gt(ann_file)
     ds = CocoDetection(img_dir, ann_file)
     all_img_ids = ds.ids
@@ -835,8 +868,7 @@ def run_ultralytics_quantized(model_key, data_yaml, calib_img_path, dataset_name
     baseline_flat = torch.cat(_flatten(baseline))
     def loss_fn(preds):
         p_flat = torch.cat(_flatten(preds))
-        min_n = min(p_flat.shape[0], baseline_flat.shape[0])
-        return 1.0 - F.cosine_similarity(p_flat[:min_n].unsqueeze(0), baseline_flat[:min_n].unsqueeze(0))
+        return cosine_distance_chunked(p_flat, baseline_flat)
 
     import random as _random
     os.environ["YOLO_VERBOSE"] = "false"
@@ -889,16 +921,31 @@ def run_ultralytics_quantized(model_key, data_yaml, calib_img_path, dataset_name
     baseline_score = eval_fn(inner, None)
     print(f"  Baseline score: {baseline_score:.4f}")
     lof_model = lof.lofloatify(inner); lof_model.to(device).eval()
-    with torch.no_grad(): lof_out = lof_model(val_data)
-    print("  Cosine distance (fully quantized vs FP32):", loss_fn(lof_out).item())
+    with torch.no_grad():
+        lof_out = lof_model(val_data)
+        cos_dist = loss_fn(lof_out).item()
+    print("  Cosine distance (fully quantized vs FP32):", cos_dist)
+    del lof_out
+    if device != 'cpu' and torch.cuda.is_available():
+        torch.cuda.empty_cache()
     print(f"  Running greedy_sensitivity quantization search (accuracy_target={accuracy_target}) ...")
     quantized_inner = ss.greedy_sensitivity(model=inner, sensitivity_measure="hessian",
         data=dataset, loss_fn=loss_fn, eval_fn=eval_fn, accuracy_target=accuracy_target,
-        bs=[4,3,2], es=[4,3,2], n_samples=n_samples, device=device, baseline=baseline_score)
+        bs=[4,3,2], es=[4,3,2], accum_bw=[14,12,10], n_samples=n_samples, device=device, baseline=baseline_score)
     print(lof.record_formats(quantized_inner))
     quantized_inner.to(device)
-    with torch.no_grad(): preds = quantized_inner(val_data)
-    print(f"  Final cosine distance: {loss_fn(preds).item():.6f}")
+    with torch.no_grad():
+        preds = quantized_inner(val_data)
+        final_cos = loss_fn(preds).item()
+    print(f"  Final cosine distance: {final_cos:.6f}")
+    del preds
+    for name,module in quantized_inner.named_modules():
+        if isinstance(module, (lof.LoF_Linear, lof.LoF_Conv2d)):
+            print(f"  Layer: {name}  |  Format: {lof.record_formats(module)}")
+            print(f"    Weights: {module.weight.shape}  |  Bias: {module.bias.shape if module.bias is not None else None}")
+            print(f"    Weight stats: mean={module.weight.mean().item():.4f}  std={module.weight.std().item():.4f}")
+    if device != 'cpu' and torch.cuda.is_available():
+        torch.cuda.empty_cache()
     model.model = quantized_inner
     t0 = time.time()
     if dataset_name == "pascal":
@@ -938,7 +985,7 @@ def run_torchvision_quantized(model_key, dataset_name, device, accuracy_target=0
     if dataset_name == "coco":
         from torchvision.datasets import CocoDetection
         img_dir = os.path.join(COCO_ROOT, "images", "val2017")
-        ann_file = os.path.join(COCO_ROOT, "annotations", "annotations", "instances_val2017.json")
+        ann_file = os.path.join(COCO_ROOT, "annotations", "annotations", "annotations", "instances_val2017.json")
         ds = CocoDetection(img_dir, ann_file, transform=transform)
         coco_gt = _get_coco_gt(ann_file)
     else:
@@ -973,8 +1020,7 @@ def run_torchvision_quantized(model_key, dataset_name, device, accuracy_target=0
     baseline_flat = _flatten(baseline_out).detach()
     def loss_fn(preds):
         p_flat = _flatten(preds)
-        min_n = min(p_flat.shape[0], baseline_flat.shape[0])
-        return 1.0 - F.cosine_similarity(p_flat[:min_n].unsqueeze(0), baseline_flat[:min_n].unsqueeze(0))
+        return cosine_distance_chunked(p_flat, baseline_flat)
 
     import random as _random
     _random.seed(42)
@@ -1002,8 +1048,13 @@ def run_torchvision_quantized(model_key, dataset_name, device, accuracy_target=0
     baseline_score = eval_fn(model, None)
     print(f"  Baseline score (subset): {baseline_score:.4f}")
     lof_model = lof.lofloatify(model); lof_model.to(device).eval()
-    with torch.no_grad(): lof_out = lof_model([img for img in calib_batch])
-    print("  Cosine distance (fully quantized vs FP32):", loss_fn(lof_out).item())
+    with torch.no_grad():
+        lof_out = lof_model([img for img in calib_batch])
+        cos_dist = loss_fn(lof_out).item()
+    print("  Cosine distance (fully quantized vs FP32):", cos_dist)
+    del lof_out
+    if device != 'cpu' and torch.cuda.is_available():
+        torch.cuda.empty_cache()
     def tv_collate_fn(batch):
         images, labels = zip(*batch)
         images = torch.stack([F.interpolate(img.unsqueeze(0), size=(target_size, target_size),
@@ -1012,12 +1063,18 @@ def run_torchvision_quantized(model_key, dataset_name, device, accuracy_target=0
     print(f"  Running greedy_sensitivity quantization search (accuracy_target={accuracy_target}) ...")
     quantized_model = ss.greedy_sensitivity(model=model, sensitivity_measure="hessian",
         data=ds, loss_fn=loss_fn, eval_fn=eval_fn, accuracy_target=accuracy_target,
-        bs=[4,3,2], es=[4,3,2,1], n_samples=n_calib, device=device,
+        bs=[4,3,2], es=[4,3,2,1], accum_bw=[14,12,10], n_samples=n_calib, device=device,
         collate_fn=tv_collate_fn, baseline=baseline_score)
     print(lof.record_formats(quantized_model))
     quantized_model.to(device).eval()
-    with torch.no_grad(): preds = quantized_model([img for img in calib_batch])
-    print(f"  Final cosine distance: {loss_fn(preds).item():.6f}")
+    with torch.no_grad():
+        preds = quantized_model([img for img in calib_batch])
+        final_cos = loss_fn(preds).item()
+    print(f"  Final cosine distance: {final_cos:.6f}")
+    del preds
+   
+    if device != 'cpu' and torch.cuda.is_available():
+        torch.cuda.empty_cache()
     if dataset_name == "coco":
         loader, coco_gt_full, _ = _build_torchvision_dataloader("coco", BATCH_SIZE)
         metrics = eval_torchvision_coco(quantized_model, loader, coco_gt_full, device)
@@ -1056,7 +1113,7 @@ def run_deimv2_quantized(dataset_name, device, accuracy_target=0.01):
     if dataset_name == "coco":
         from torchvision.datasets import CocoDetection
         img_dir = os.path.join(COCO_ROOT, "images", "val2017")
-        ann_file = os.path.join(COCO_ROOT, "annotations", "annotations", "instances_val2017.json")
+        ann_file = os.path.join(COCO_ROOT, "annotations", "annotations", "annotations", "instances_val2017.json")
         ds = CocoDetection(img_dir, ann_file)
     else:
         from torchvision.datasets import VOCDetection
@@ -1091,8 +1148,7 @@ def run_deimv2_quantized(dataset_name, device, accuracy_target=0.01):
     baseline_flat = _flatten(baseline_out).detach()
     def loss_fn(preds):
         p_flat = _flatten(preds)
-        min_n = min(p_flat.shape[0], baseline_flat.shape[0])
-        return 1.0 - F.cosine_similarity(p_flat[:min_n].unsqueeze(0), baseline_flat[:min_n].unsqueeze(0))
+        return cosine_distance_chunked(p_flat, baseline_flat)
 
     # Subset eval helpers (unwrap automatically)
     import random as _random
@@ -1105,7 +1161,7 @@ def run_deimv2_quantized(dataset_name, device, accuracy_target=0.01):
         raw_m = _unwrap_deimv2(m); raw_m.eval().to(device)
         results_list = []
         if dataset_name == "coco":
-            coco_gt = _get_coco_gt(os.path.join(COCO_ROOT, "annotations", "annotations", "instances_val2017.json"))
+            coco_gt = _get_coco_gt(os.path.join(COCO_ROOT, "annotations", "annotations", "annotations","instances_val2017.json"))
             base_ds = subset.dataset if isinstance(subset, Subset) else subset
             all_ids = base_ds.ids
         n = len(subset)
@@ -1186,8 +1242,13 @@ def run_deimv2_quantized(dataset_name, device, accuracy_target=0.01):
     print(f"  Baseline score (subset): {baseline_score:.4f}")
 
     lof_model = lof.lofloatify(wrapped_model); lof_model.to(device).eval()
-    with torch.no_grad(): lof_out = lof_model(calib_batch)
-    print("  Cosine distance (fully quantized vs FP32):", loss_fn(lof_out).item())
+    with torch.no_grad():
+        lof_out = lof_model(calib_batch)
+        cos_dist = loss_fn(lof_out).item()
+    print("  Cosine distance (fully quantized vs FP32):", cos_dist)
+    del lof_out
+    if device != 'cpu' and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # Calib dataset — just images (wrapper handles sizes)
     class DEIMv2CalibDataset(Dataset):
@@ -1202,12 +1263,17 @@ def run_deimv2_quantized(dataset_name, device, accuracy_target=0.01):
     quantized_wrapped = ss.greedy_sensitivity(
         model=wrapped_model, sensitivity_measure="hessian", data=calib_ds,
         loss_fn=loss_fn, eval_fn=eval_fn, accuracy_target=accuracy_target,
-        bs=[4,3,2], es=[4,3,2,1], n_samples=n_calib, device=device, baseline=baseline_score)
+        bs=[4,3,2], es=[4,3,2,1], accum_bw=[14,12,10], n_samples=n_calib, device=device, baseline=baseline_score)
 
     print(lof.record_formats(quantized_wrapped))
     quantized_wrapped.to(device).eval()
-    with torch.no_grad(): preds = quantized_wrapped(calib_batch)
-    print(f"  Final cosine distance: {loss_fn(preds).item():.6f}")
+    with torch.no_grad():
+        preds = quantized_wrapped(calib_batch)
+        final_cos = loss_fn(preds).item()
+    print(f"  Final cosine distance: {final_cos:.6f}")
+    del preds
+    if device != 'cpu' and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # Final eval on full dataset (eval functions auto-unwrap)
     if dataset_name == "coco":

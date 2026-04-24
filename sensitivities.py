@@ -56,51 +56,78 @@ def batch_hutchinson_approx(model, loss, param, n_samples, retain_graph=True, ba
 
     return trace_accumulator / n_samples
 
-def find_range(model, dataset, n_samples=256, device='cuda', collate_fn=None):
-    weights_minmax = {}
-    activations_minmax = {}
-    bias_minmax = {}
-    calib_data = make_calib_data(dataset=dataset, n_samples=n_samples, collate_fn=collate_fn)
-    calib_data = calib_data.to(device)
-
-    # Capture activations
-    captured_activations = {}
-    def make_capture_hook(layer_name):
-        def hook(module, input, output):
-            captured_activations[layer_name] = input[0].detach()
-        return hook
+def find_range(model, dataset, n_samples=256, device='cuda',
+               collate_fn=None, chunk_size=32):
     model.eval()
-    capture_hooks = [
-        module.register_forward_hook(make_capture_hook(name))
+
+    calib_data_cpu = make_calib_data(
+        dataset=dataset, n_samples=n_samples, collate_fn=collate_fn
+    )
+
+    act_max = {}
+    act_min = {}  # smallest nonzero |x|
+
+    def make_hook(layer_name):
+        def hook(module, inp, out):
+            x = inp[0].detach().abs()
+            cur_max = x.max().item()
+            # cheap nonzero-min without materializing a filtered copy:
+            # replace zeros with +inf, take min
+            x_nz = torch.where(x > 0, x, torch.full_like(x, float('inf')))
+            cur_min = x_nz.min().item()
+            if cur_min == float('inf'):
+                cur_min = 0.0
+
+            if layer_name not in act_max:
+                act_max[layer_name] = cur_max
+                act_min[layer_name] = cur_min if cur_min > 0 else float('inf')
+            else:
+                act_max[layer_name] = max(act_max[layer_name], cur_max)
+                if cur_min > 0:
+                    act_min[layer_name] = min(act_min[layer_name], cur_min)
+        return hook
+
+    hooks = [
+        module.register_forward_hook(make_hook(name))
         for name, module in model.named_modules()
         if isinstance(module, (LoF_Linear, LoF_Conv2d))
     ]
 
-
     with torch.no_grad():
-        model(calib_data)
-    for h in capture_hooks:
+        for i in range(0, n_samples, chunk_size):
+            chunk = calib_data_cpu[i:i+chunk_size].to(device, non_blocking=True)
+            model(chunk)
+            del chunk
+            if device != 'cpu' and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    for h in hooks:
         h.remove()
 
+    # Weights + biases are tiny relative to activations — do them plainly.
     def abs_range(tensor):
-        flat = tensor.abs().flatten()
-        nonzero = flat[flat != 0]
-        min_val = nonzero.min().item() if len(nonzero) > 0 else 0.0
-        max_val = flat.max().item()
-        return {"min": min_val, "max": max_val}
+        t = tensor.detach().abs()
+        mx = t.max().item()
+        t_nz = torch.where(t > 0, t, torch.full_like(t, float('inf')))
+        mn = t_nz.min().item()
+        return {"min": (mn if mn != float('inf') else 0.0), "max": mx}
 
+    weights_minmax, activations_minmax, bias_minmax = {}, {}, {}
     for name, module in model.named_modules():
         if not isinstance(module, (LoF_Linear, LoF_Conv2d)):
             continue
-        if name not in captured_activations:
+        if name not in act_max:
             print(f"  [SKIP] {name} — forward() never called")
             continue
-        weights_minmax[name]     = abs_range(module.weight.detach())
-        activations_minmax[name] = abs_range(captured_activations[name])
-        bias_minmax[name]        = abs_range(module.bias.detach()) if module.bias is not None else {"min": 0.0, "max": 0.0}
+        activations_minmax[name] = {
+            "min": act_min[name] if act_min[name] != float('inf') else 0.0,
+            "max": act_max[name],
+        }
+        weights_minmax[name] = abs_range(module.weight)
+        bias_minmax[name] = (abs_range(module.bias) if module.bias is not None
+                             else {"min": 0.0, "max": 0.0})
 
     return weights_minmax, activations_minmax, bias_minmax
-
 
 def find_exp_bits_and_bias(weights_minmax, activations_minmax, bias_minmax):
 
@@ -135,6 +162,85 @@ def find_exp_bits_and_bias(weights_minmax, activations_minmax, bias_minmax):
     return weights_exp_bits, weights_bias, activations_exp_bits, activations_bias, bias_exp_bits, bias_bias
 
 
+def find_batchnorm_scales(model, dataset, n_samples=256, device='cuda',
+                          collate_fn=None, chunk_size=32, eps=1e-5):
+    """
+    Scan model for BatchNorm2d layers; compute per-channel empirical
+    L1 / L2 / Linf dispersion via forward hooks. Returns:
+        L1_scales[name]   = (MAD    + eps) / sqrt(var + eps)   # shape [C]
+        Linf_scales[name] = (maxdev + eps) / sqrt(var + eps)   # shape [C]
+
+    Reduction matches BN2d (over N, H, W). Single forward pass. Per-batch
+    stats combined as N-weighted mean (MAD, var) and running max (maxdev).
+    All accumulators are [C] and live on CPU.
+    """
+    model.eval()
+
+    calib_data_cpu = make_calib_data(
+        dataset=dataset, n_samples=n_samples, collate_fn=collate_fn
+    )
+
+    mad_sum = {}   # weighted-sum of per-batch MAD, CPU, [C]
+    var_sum = {}   # weighted-sum of per-batch var, CPU, [C]
+    maxdev  = {}   # running per-channel max of |x - mean|, CPU, [C]
+    n_total = {}   # total batch samples seen per layer
+
+    def make_hook(layer_name):
+        def hook(module, inp, out):
+            x = inp[0].detach()
+            reduce_dims = [0] + list(range(2, x.dim()))    # [0, 2, 3] for BN2d
+            view_shape  = [1, -1] + [1] * (x.dim() - 2)
+
+            mean = x.mean(dim=reduce_dims)
+            x_c  = x - mean.view(view_shape)               # 1 big tensor
+
+            # var BEFORE abs_ so we only ever hold one x-sized tensor after this
+            var_b = x_c.pow(2).mean(dim=reduce_dims).cpu()
+            x_c.abs_()                                     # in-place: |x - mean|
+            mad_b = x_c.mean(dim=reduce_dims).cpu()
+            mxd_b = x_c.amax(dim=reduce_dims).cpu()
+            del x_c
+
+            bn = x.shape[0]
+            if layer_name not in mad_sum:
+                mad_sum[layer_name] = mad_b.mul_(bn)
+                var_sum[layer_name] = var_b.mul_(bn)
+                maxdev[layer_name]  = mxd_b
+                n_total[layer_name] = bn
+            else:
+                mad_sum[layer_name].add_(mad_b, alpha=bn)
+                var_sum[layer_name].add_(var_b, alpha=bn)
+                torch.maximum(maxdev[layer_name], mxd_b, out=maxdev[layer_name])
+                n_total[layer_name] += bn
+        return hook
+
+    hooks = [
+        m.register_forward_hook(make_hook(name))
+        for name, m in model.named_modules()
+        if isinstance(m, nn.BatchNorm2d)
+    ]
+
+    with torch.no_grad():
+        for i in range(0, n_samples, chunk_size):
+            chunk = calib_data_cpu[i:i+chunk_size].to(device, non_blocking=True)
+            model(chunk)
+            del chunk
+            if device != 'cpu' and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    for h in hooks:
+        h.remove()
+
+    L1_scales, Linf_scales = {}, {}
+    for name in mad_sum:
+        w         = n_total[name]
+        mad_mean  = mad_sum[name] / w
+        var_mean  = var_sum[name] / w
+        std       = (var_mean + eps).sqrt()
+        L1_scales[name]   = (mad_mean       + eps) / std
+        Linf_scales[name] = (maxdev[name]   + eps) / std
+
+    return L1_scales, Linf_scales
 
 import contextlib
 
@@ -153,68 +259,17 @@ import torch.nn.functional as F
 from contextlib import nullcontext
 
 def hess_sensitivity(
-    model,
-    dataset,
-    n_samples=8,
-    device='cpu',
-    collate_fn=None,
-    chunk_size=4,
-    target_layer_types=None
+    model, dataset, n_samples=8, device='cpu',
+    collate_fn=None, chunk_size=4, target_layer_types=None,
 ):
-    """
-    Compute diagonal Fisher Information (Hessian approx) per layer.
-    """
-    weight_sensitivity = {}
-    activation_sensitivity = {}
-    bias_sensitivity = {}
-
     model.eval()
     model.to(device)
 
-    calib_data = make_calib_data(dataset=dataset, n_samples=n_samples, collate_fn=collate_fn)
-    calib_data = calib_data.to(device)
+    calib_data_cpu = make_calib_data(
+        dataset=dataset, n_samples=n_samples, collate_fn=collate_fn
+    )
+    n = calib_data_cpu.size(0)
 
-    n = calib_data.size(0)
-
-    # ── Compute baseline output (detached, full batch, no grad) ──
-    def detach_output(x):
-        if isinstance(x, torch.Tensor):
-            return x.detach()
-        elif isinstance(x, dict):
-            return {k: detach_output(v) for k, v in x.items()}
-        elif isinstance(x, (list, tuple)):
-            return type(x)(detach_output(v) for v in x)
-        return x
-
-    with torch.no_grad():
-        baseline = detach_output(model(calib_data))
-
-    # ── Loss: cosine distance, flatten to avoid broadcasting ──
-    def cosine_loss_recursive(p, b):
-        if isinstance(b, torch.Tensor):
-            p_flat = p.reshape(-1).float()
-            b_flat = b.reshape(-1).float()
-            min_len = min(p_flat.shape[0], b_flat.shape[0])
-            return 1.0 - F.cosine_similarity(
-                p_flat[:min_len].unsqueeze(0),
-                b_flat[:min_len].unsqueeze(0)
-            ).squeeze()
-        elif isinstance(b, dict):
-            return sum(cosine_loss_recursive(p[k], b[k]) for k in b)
-        elif isinstance(b, (list, tuple)):
-            return sum(cosine_loss_recursive(pi, bi) for pi, bi in zip(p, b))
-        return torch.tensor(0.0, device=device)
-
-    def slice_output(x, i):
-        if isinstance(x, torch.Tensor):
-            return x[i:i+1]
-        elif isinstance(x, dict):
-            return {k: slice_output(v, i) for k, v in x.items()}
-        elif isinstance(x, (list, tuple)):
-            return type(x)(slice_output(v, i) for v in x)
-        return x
-
-    # ── Identify target layers ──
     if target_layer_types is None:
         target_layer_types = (LoF_Linear, LoF_Conv2d)
 
@@ -223,101 +278,117 @@ def hess_sensitivity(
         if isinstance(module, target_layer_types)
     }
 
-    # ── Build a fast param-name lookup ──
+    # Map param pointer -> full name
     target_param_ptrs = {}
     for layer_name, module in target_layers.items():
-        for param_name, param in module.named_parameters(recurse=False):
-            full_name = f"{layer_name}.{param_name}"
-            target_param_ptrs[param.data_ptr()] = (full_name, 'bias' in param_name)
+        for pname, p in module.named_parameters(recurse=False):
+            target_param_ptrs[p.data_ptr()] = f"{layer_name}.{pname}"
 
-    # ── Pre-allocate accumulators ──
-    param_grad_sq = {}
-    for pname, param in model.named_parameters():
-        if param.data_ptr() in target_param_ptrs:
-            param_grad_sq[target_param_ptrs[param.data_ptr()][0]] = \
-                torch.zeros_like(param, dtype=torch.float32)
-
+    # SCALAR accumulators — not full-shape tensors
+    param_grad_sq = {full: 0.0 for full in target_param_ptrs.values()}
     activation_grads = {name: 0.0 for name in target_layers}
 
-    # ── Activation hooks ──
-    captured_inputs = {}
-
-    def make_activation_hook(layer_name):
+    # Tensor-level grad hooks: no activation retention, no module backward hook
+    def make_fwd_hook(layer_name):
         def hook(module, inp, out):
             act = inp[0]
+            if not isinstance(act, torch.Tensor):
+                return
             if not act.requires_grad:
                 act.requires_grad_(True)
-                act.retain_grad()
-            captured_inputs[layer_name] = act
+            def grad_hook(grad):
+                activation_grads[layer_name] += grad.detach().float().pow(2).sum().item()
+            act.register_hook(grad_hook)
         return hook
 
-    fwd_hooks = []
-    for name, module in target_layers.items():
-        fwd_hooks.append(module.register_forward_hook(make_activation_hook(name)))
+    fwd_hooks = [
+        m.register_forward_hook(make_fwd_hook(name))
+        for name, m in target_layers.items()
+    ]
 
-    # ── Main loop ──
-    for chunk_start in range(0, n, chunk_size):
-        chunk_end = min(chunk_start + chunk_size, n)
+    def cosine_loss(p, b):
+        if isinstance(p, torch.Tensor):
+            pf = p.reshape(-1).float()
+            bf = b.reshape(-1).float()
+            m = min(pf.shape[0], bf.shape[0])
+            return 1.0 - F.cosine_similarity(
+                pf[:m].unsqueeze(0), bf[:m].unsqueeze(0)
+            ).squeeze()
+        if isinstance(p, dict):
+            return sum(cosine_loss(p[k], b[k]) for k in b)
+        if isinstance(p, (list, tuple)):
+            return sum(cosine_loss(pi, bi) for pi, bi in zip(p, b))
+        return torch.tensor(0.0, device=device)
 
-        for i in range(chunk_start, chunk_end):
+    def slice_out(x, i):
+        if isinstance(x, torch.Tensor): return x[i:i+1]
+        if isinstance(x, dict): return {k: slice_out(v, i) for k, v in x.items()}
+        if isinstance(x, (list, tuple)): return type(x)(slice_out(v, i) for v in x)
+        return x
+
+    # Process one chunk at a time: compute baseline for the chunk, then
+    # per-sample backward inside it. Baseline chunk is released before next chunk.
+    for c0 in range(0, n, chunk_size):
+        c1 = min(c0 + chunk_size, n)
+        chunk = calib_data_cpu[c0:c1].to(device, non_blocking=True)
+
+        with torch.no_grad():
+            baseline_chunk = model(chunk)
+            if isinstance(baseline_chunk, torch.Tensor):
+                baseline_chunk = baseline_chunk.detach()
+
+        for j in range(c1 - c0):
             model.zero_grad(set_to_none=True)
-            captured_inputs.clear()
 
-            sample = calib_data[i:i+1]
-            sample_baseline = slice_output(baseline, i)
+            sample = chunk[j:j+1]
+            sample_baseline = slice_out(baseline_chunk, j)
 
             output = model(sample)
-            loss = cosine_loss_recursive(output, sample_baseline)
+            loss = cosine_loss(output, sample_baseline)
             loss.backward()
 
-            # ── Accumulate squared grads (only target params) ──
-            for param in model.parameters():
-                ptr = param.data_ptr()
-                if ptr in target_param_ptrs and param.grad is not None:
-                    full_name = target_param_ptrs[ptr][0]
-                    g = param.grad.detach().float()
-                    param_grad_sq[full_name].addcmul_(g, g, value=1.0)
+            # scalar accumulate — no per-param tensor allocation
+            for p in model.parameters():
+                ptr = p.data_ptr()
+                if ptr in target_param_ptrs and p.grad is not None:
+                    param_grad_sq[target_param_ptrs[ptr]] += \
+                        p.grad.detach().float().pow(2).sum().item()
 
-            # ── Activation grads ──
-            for layer_name, act in captured_inputs.items():
-                if act.grad is not None:
-                    g = act.grad.detach().float()
-                    activation_grads[layer_name] += g.pow(2).sum().item()
+            del output, loss, sample_baseline, sample
 
-        # Free intermediate graph memory between chunks
+        del chunk, baseline_chunk
         if device != 'cpu' and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # ── Cleanup hooks ──
     for h in fwd_hooks:
         h.remove()
-
-    # ── Average and organize results ──
+    weight_sensitivity, bias_sensitivity, activation_sensitivity, accum_sensitivity = {}, {}, {}, {}
     for layer_name, module in target_layers.items():
-        w_traces = {}
-        b_traces = {}
+        w_traces, b_traces = {}, {}
+        for pname, param in module.named_parameters(recurse=False):
+            full = f"{layer_name}.{pname}"
+            trace_val = param_grad_sq.get(full, 0.0) / n
+            (b_traces if 'bias' in pname else w_traces)[pname] = trace_val
 
-        for param_name, _ in module.named_parameters(recurse=False):
-            full_name = f"{layer_name}.{param_name}"
-            fisher_diag = param_grad_sq.get(full_name)
-            trace_val = (fisher_diag.sum().item() / n) if fisher_diag is not None else 0.0
-
-            if 'bias' in param_name:
-                b_traces[param_name] = trace_val
-            else:
-                w_traces[param_name] = trace_val
+            if 'weight' in pname:
+                w_frob = param.detach().float().norm().item()  # Frobenius norm
+                if isinstance(module, LoF_Linear):
+                    k = module.weight.shape[1]                 # [out, in] → k = in
+                elif isinstance(module, LoF_Conv2d):
+                    k = param.shape[1] * param.shape[2] * param.shape[3]  # in_C * kH * kW
+                else:
+                    k = 1
+                accum_sensitivity[layer_name] = w_frob * math.sqrt(k) * trace_val
 
         weight_sensitivity[layer_name] = w_traces
         bias_sensitivity[layer_name] = b_traces
-
     for k in activation_grads:
         activation_sensitivity[k] = activation_grads[k] / n
 
-    if torch.cuda.is_available():
+    if device != 'cpu' and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return weight_sensitivity, activation_sensitivity, bias_sensitivity
-
+    return weight_sensitivity, activation_sensitivity, bias_sensitivity, accum_sensitivity
     
 def noise_sensitivity_full(model, dataset, loss_fn, n_samples=256, device='cpu', collate_fn=None):
 
@@ -393,6 +464,13 @@ def noise_sensitivity_full(model, dataset, loss_fn, n_samples=256, device='cpu',
 
     return weight_sensitivity, activation_sensitivity, bias_sensitivity  
 
+
+
+def replace_batchnorm(model):
+    for name, module in model.named_modules():
+        if isinstance(module, nn.BatchNorm2d):
+            setattr(model, name, nn.Identity())
+    return model
 
 #works by using forward hook to collect data at the layer, for XX^t and perform Cholesky decomp. Then we use GPTQ to update the weight and continue with the forward pass
 def quantize_weights_with_gptq(model, dataset, exponent_bits, mantissa_bits, n_samples=256, device='cpu', perturb_ratio=0.01, collate_fn=None):

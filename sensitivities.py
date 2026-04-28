@@ -160,62 +160,55 @@ def find_exp_bits_and_bias(weights_minmax, activations_minmax, bias_minmax):
         bias_bias[name] = 0
 
     return weights_exp_bits, weights_bias, activations_exp_bits, activations_bias, bias_exp_bits, bias_bias
-
-
 def find_batchnorm_scales(model, dataset, n_samples=256, device='cuda',
-                          collate_fn=None, chunk_size=32, eps=1e-5):
-    """
-    Scan model for BatchNorm2d layers; compute per-channel empirical
-    L1 / L2 / Linf dispersion via forward hooks. Returns:
-        L1_scales[name]   = (MAD    + eps) / sqrt(var + eps)   # shape [C]
-        Linf_scales[name] = (maxdev + eps) / sqrt(var + eps)   # shape [C]
-
-    Reduction matches BN2d (over N, H, W). Single forward pass. Per-batch
-    stats combined as N-weighted mean (MAD, var) and running max (maxdev).
-    All accumulators are [C] and live on CPU.
-    """
+                          collate_fn=None, chunk_size=32,
+                          linf_quantile=0.999):
     model.eval()
-
     calib_data_cpu = make_calib_data(
         dataset=dataset, n_samples=n_samples, collate_fn=collate_fn
     )
 
-    mad_sum = {}   # weighted-sum of per-batch MAD, CPU, [C]
-    var_sum = {}   # weighted-sum of per-batch var, CPU, [C]
-    maxdev  = {}   # running per-channel max of |x - mean|, CPU, [C]
-    n_total = {}   # total batch samples seen per layer
+    # Per-layer accumulators
+    mad_sum, maxdev_sum, n_total = {}, {}, {}
+    bn_modules = {}  # name -> module, so we can read running_var directly
 
-    def make_hook(layer_name):
-        def hook(module, inp, out):
+    def make_hook(name, module):
+        bn_modules[name] = module
+        # Use BN's own running stats — these are what the model actually uses
+        mean = module.running_mean.detach()  # [C], on device
+        view_shape = None  # set on first call
+
+        def hook(_, inp, __):
+            nonlocal view_shape
             x = inp[0].detach()
-            reduce_dims = [0] + list(range(2, x.dim()))    # [0, 2, 3] for BN2d
-            view_shape  = [1, -1] + [1] * (x.dim() - 2)
+            if view_shape is None:
+                view_shape = [1, -1] + [1] * (x.dim() - 2)
+            reduce_dims = [0] + list(range(2, x.dim()))
 
-            mean = x.mean(dim=reduce_dims)
-            x_c  = x - mean.view(view_shape)               # 1 big tensor
-
-            # var BEFORE abs_ so we only ever hold one x-sized tensor after this
-            var_b = x_c.pow(2).mean(dim=reduce_dims).cpu()
-            x_c.abs_()                                     # in-place: |x - mean|
+            x_c = (x - mean.view(view_shape)).abs_()  # |x - μ_running|
             mad_b = x_c.mean(dim=reduce_dims).cpu()
-            mxd_b = x_c.amax(dim=reduce_dims).cpu()
-            del x_c
 
+            # Quantile-based "soft max" — flatten non-channel dims
+            C = x_c.shape[1]
+            x_c_flat = x_c.permute(1, 0, *range(2, x_c.dim())).reshape(C, -1)
+            mxd_b = torch.quantile(x_c_flat, linf_quantile, dim=1).cpu()
+
+            del x_c, x_c_flat
             bn = x.shape[0]
-            if layer_name not in mad_sum:
-                mad_sum[layer_name] = mad_b.mul_(bn)
-                var_sum[layer_name] = var_b.mul_(bn)
-                maxdev[layer_name]  = mxd_b
-                n_total[layer_name] = bn
+
+            if name not in mad_sum:
+                mad_sum[name] = mad_b * bn
+                maxdev_sum[name] = mxd_b * bn
+                n_total[name] = bn
             else:
-                mad_sum[layer_name].add_(mad_b, alpha=bn)
-                var_sum[layer_name].add_(var_b, alpha=bn)
-                torch.maximum(maxdev[layer_name], mxd_b, out=maxdev[layer_name])
-                n_total[layer_name] += bn
+                mad_sum[name].add_(mad_b, alpha=bn)
+                maxdev_sum[name].add_(mxd_b, alpha=bn)
+                n_total[name] += bn
+
         return hook
 
     hooks = [
-        m.register_forward_hook(make_hook(name))
+        m.register_forward_hook(make_hook(name, m))
         for name, m in model.named_modules()
         if isinstance(m, nn.BatchNorm2d)
     ]
@@ -224,23 +217,29 @@ def find_batchnorm_scales(model, dataset, n_samples=256, device='cuda',
         for i in range(0, n_samples, chunk_size):
             chunk = calib_data_cpu[i:i+chunk_size].to(device, non_blocking=True)
             model(chunk)
-            del chunk
-            if device != 'cpu' and torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
     for h in hooks:
         h.remove()
 
     L1_scales, Linf_scales = {}, {}
-    for name in mad_sum:
-        w         = n_total[name]
-        mad_mean  = mad_sum[name] / w
-        var_mean  = var_sum[name] / w
-        std       = (var_mean + eps).sqrt()
-        L1_scales[name]   = (mad_mean       + eps) / std
-        Linf_scales[name] = (maxdev[name]   + eps) / std
+    for name, module in bn_modules.items():
+        w = n_total[name]
+        mad_mean = mad_sum[name] / w
+        maxdev_mean = maxdev_sum[name] / w
+
+        # Use BN's actual normalization constant
+        std = (module.running_var + module.eps).sqrt().cpu()
+
+        L1_scales[name] = mad_mean / std
+        Linf_scales[name] = maxdev_mean / std
 
     return L1_scales, Linf_scales
+
+
+def find_gemm_grades(model, dataset, accum_sensitivities, device='cuda'):
+    model.eval()
+    model.to(device)
+
 
 import contextlib
 
@@ -257,7 +256,6 @@ from pyhessian import hessian as pyhessian
 import torch
 import torch.nn.functional as F
 from contextlib import nullcontext
-
 def hess_sensitivity(
     model, dataset, n_samples=8, device='cpu',
     collate_fn=None, chunk_size=4, target_layer_types=None,
@@ -306,45 +304,34 @@ def hess_sensitivity(
         for name, m in target_layers.items()
     ]
 
-    def cosine_loss(p, b):
-        if isinstance(p, torch.Tensor):
-            pf = p.reshape(-1).float()
-            bf = b.reshape(-1).float()
-            m = min(pf.shape[0], bf.shape[0])
-            return 1.0 - F.cosine_similarity(
-                pf[:m].unsqueeze(0), bf[:m].unsqueeze(0)
-            ).squeeze()
-        if isinstance(p, dict):
-            return sum(cosine_loss(p[k], b[k]) for k in b)
-        if isinstance(p, (list, tuple)):
-            return sum(cosine_loss(pi, bi) for pi, bi in zip(p, b))
-        return torch.tensor(0.0, device=device)
+    def output_l2(x):
+        if isinstance(x, torch.Tensor):
+            if x.is_floating_point() and x.requires_grad:
+                return 0.5 * x.float().pow(2).sum()
+            return None
+        if isinstance(x, dict):
+            terms = [output_l2(v) for v in x.values()]
+        elif isinstance(x, (list, tuple)):
+            terms = [output_l2(v) for v in x]
+        else:
+            return None
+        terms = [t for t in terms if t is not None]
+        return sum(terms) if terms else None
 
-    def slice_out(x, i):
-        if isinstance(x, torch.Tensor): return x[i:i+1]
-        if isinstance(x, dict): return {k: slice_out(v, i) for k, v in x.items()}
-        if isinstance(x, (list, tuple)): return type(x)(slice_out(v, i) for v in x)
-        return x
-
-    # Process one chunk at a time: compute baseline for the chunk, then
-    # per-sample backward inside it. Baseline chunk is released before next chunk.
+    # Process one chunk at a time, per-sample backward.
     for c0 in range(0, n, chunk_size):
         c1 = min(c0 + chunk_size, n)
         chunk = calib_data_cpu[c0:c1].to(device, non_blocking=True)
-
-        with torch.no_grad():
-            baseline_chunk = model(chunk)
-            if isinstance(baseline_chunk, torch.Tensor):
-                baseline_chunk = baseline_chunk.detach()
 
         for j in range(c1 - c0):
             model.zero_grad(set_to_none=True)
 
             sample = chunk[j:j+1]
-            sample_baseline = slice_out(baseline_chunk, j)
 
             output = model(sample)
-            loss = cosine_loss(output, sample_baseline)
+            loss = output_l2(output)
+            if loss is None:
+                continue
             loss.backward()
 
             # scalar accumulate — no per-param tensor allocation
@@ -354,9 +341,9 @@ def hess_sensitivity(
                     param_grad_sq[target_param_ptrs[ptr]] += \
                         p.grad.detach().float().pow(2).sum().item()
 
-            del output, loss, sample_baseline, sample
+            del output, loss, sample
 
-        del chunk, baseline_chunk
+        del chunk
         if device != 'cpu' and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -389,7 +376,8 @@ def hess_sensitivity(
         torch.cuda.empty_cache()
 
     return weight_sensitivity, activation_sensitivity, bias_sensitivity, accum_sensitivity
-    
+
+
 def noise_sensitivity_full(model, dataset, loss_fn, n_samples=256, device='cpu', collate_fn=None):
 
     weight_sensitivity = {}
@@ -472,183 +460,222 @@ def replace_batchnorm(model):
             setattr(model, name, nn.Identity())
     return model
 
-#works by using forward hook to collect data at the layer, for XX^t and perform Cholesky decomp. Then we use GPTQ to update the weight and continue with the forward pass
-def quantize_weights_with_gptq(model, dataset, exponent_bits, mantissa_bits, n_samples=256, device='cpu', perturb_ratio=0.01, collate_fn=None):
+
+
+def quantize_weights_with_gptq(
+    model,
+    dataset,
+    exponent_bits,
+    mantissa_bits,
+    n_samples=256,
+    device='cpu',
+    perturb_ratio=0.01,
+    collate_fn=None,
+    micro_batch_size=4,
+):
+    """
+    Memory-efficient sequential GPTQ for LoF layers.
+
+    Processes one layer at a time:
+      For each LoF layer L (in forward order):
+        1. Register a Hessian-accumulation hook on L.
+        2. Run the calibration set through the model in micro-batches.
+           Earlier layers have *already* been quantized in previous
+           iterations, so L's Hessian is built from the same post-
+           quantization activations the original single-pass code saw.
+        3. Apply the SparseGPT + GPTQ block update to L.
+        4. Remove the hook and move on.
+
+    This restores the error-feedback property of the original code (each
+    layer compensates for upstream quantization error) while never holding
+    more than one layer's Hessian or activations in memory.
+
+    Cost: roughly N_layers forward passes through the model. For YOLOv8n /
+    YOLO26n this is a minute or two on a 3070 with micro_batch_size=1.
+    """
     model.eval()
     model.to(device)
+
     calib_data = make_calib_data(dataset=dataset, n_samples=n_samples, collate_fn=collate_fn)
-    calib_data = calib_data.to(device)
-    captured_activations = {}
-    captured_pre_choleskys = {}
+    calib_data = calib_data.cpu()  # move per micro-batch
+
     blocksize = 64
+    use_cuda = str(device).startswith('cuda')
 
-    def make_capture_hook(layer_name):
-        def hook(module, input):
-            exp_bits = exponent_bits[layer_name]
-            mant_bits = mantissa_bits[layer_name]
-            smallest_subnormal = 2 ** (1 - (1 << exp_bits) - mant_bits)
+    # LoF layers in forward (registration) order
+    lof_layers = [
+        (name, m) for name, m in model.named_modules()
+        if isinstance(m, (LoF_Linear, LoF_Conv2d))
+    ]
 
+    for layer_idx, (layer_name, module) in enumerate(lof_layers):
+        # ---------- Phase 1: accumulate H for this layer only ----------
+        hess_state = {'H_sum': None, 'n': 0}
+
+        def _accumulate(H_local, n_local):
+            if hess_state['H_sum'] is None:
+                hess_state['H_sum'] = H_local
+            else:
+                hess_state['H_sum'].add_(H_local)
+            hess_state['n'] += n_local
+
+        def hook(mod, input):
             X = input[0].detach()
 
-            # --- Build Hessian (X^T X / n) ---
-            if isinstance(module, LoF_Conv2d) and module.groups > 1:
-                C = module.weight.shape[0]
-                kH, kW = module.kernel_size
+            # Depthwise conv: H is (k^2, k^2)
+            if isinstance(mod, LoF_Conv2d) and mod.groups > 1:
+                C = mod.weight.shape[0]
+                kH, kW = mod.kernel_size
                 k2 = kH * kW
-                X_unf = torch.nn.functional.unfold(
-                    X,
-                    kernel_size=module.kernel_size,
-                    stride=module.stride,
-                    padding=module.padding,
-                    dilation=module.dilation,
-                )
-                X_unf = X_unf.reshape(X.shape[0], C, k2, -1)
-                X_unf = X_unf.permute(1, 2, 0, 3).reshape(C, k2, -1)
-                H = torch.zeros(k2, k2, device=X.device)
-                for c in range(C):
-                    H += X_unf[c] @ X_unf[c].t()
-                H /= (C * X_unf.shape[2])
-            elif X.ndim == 3:
-                X = X.reshape(-1, X.shape[-1])
-                nsamples = X.shape[0]
-                H = (X.t() @ X) / nsamples
-            elif X.ndim == 4:
-                X = torch.nn.functional.unfold(
-                    X,
-                    kernel_size=module.kernel_size,
-                    stride=module.stride,
-                    padding=module.padding,
-                    dilation=module.dilation,
-                )
-                X = X.permute(0, 2, 1).reshape(-1, X.shape[1])
-                nsamples = X.shape[0]
-                H = (X.t() @ X) / nsamples
-            else:
-                nsamples = X.shape[0]
-                H = (X.t() @ X) / nsamples
-
-            # --- Shared GPTQ from here ---
-            damp = perturb_ratio * torch.diag(H).mean()
-            H += damp * torch.eye(H.shape[0], device=H.device)
-            perm = torch.argsort(torch.diag(H), descending=True)
-            invperm = torch.argsort(perm)
-
-            W = module.weight.data.clone()
-
-            # --- Underflow mask: weights that will be forced to zero (SparseGPT) ---
-            underflow_mask = W.abs() < smallest_subnormal
-
-            orig_shape = W.shape
-
-            # Reshape for conv layers (flatten spatial dims into columns)
-            if W.ndim == 4:
-                W = W.reshape(W.shape[0], -1)
-                underflow_mask = underflow_mask.reshape(underflow_mask.shape[0], -1)
-
-            columns = W.shape[1]
-
-            # Apply the same column permutation to W, H, and the underflow mask
-            W = W[:, perm]
-            H = H[perm][:, perm]
-            underflow_mask = underflow_mask[:, perm]
-
-            # --- Cholesky decomposition of Hessian inverse ---
-            def has_inf_or_nan(tensor):
-                return not torch.isfinite(tensor).all()
-
-            try:
-                H_d = H.double()
-                cho = torch.linalg.cholesky(H_d)
-                H_inv = torch.cholesky_inverse(cho)
-                Hinv = torch.linalg.cholesky(H_inv, upper=True).float()
-            except torch.linalg.LinAlgError:
-                print(f"  [WARN] Cholesky failed for layer {layer_name}, skipping GPTQ (keeping weights as-is)")
+                H_local = torch.zeros(k2, k2, device=X.device)
+                n_local = 0
+                for b in range(X.shape[0]):
+                    X_unf = torch.nn.functional.unfold(
+                        X[b:b + 1],
+                        kernel_size=mod.kernel_size,
+                        stride=mod.stride,
+                        padding=mod.padding,
+                        dilation=mod.dilation,
+                    )                                              # (1, C*k2, L)
+                    X_unf = X_unf.reshape(1, C, k2, -1).squeeze(0)  # (C, k2, L)
+                    L = X_unf.shape[-1]
+                    for c in range(C):
+                        Xc = X_unf[c]
+                        H_local.add_(Xc @ Xc.t())
+                    n_local += C * L
+                    del X_unf
+                _accumulate(H_local, n_local)
                 return
-           
 
-            Q = torch.zeros_like(W)
+            # 3D linear input
+            if X.ndim == 3:
+                X2 = X.reshape(-1, X.shape[-1])
+                _accumulate(X2.t() @ X2, X2.shape[0])
+                return
 
-            # --- Joint SparseGPT + GPTQ block loop ---
-            for i1 in range(0, columns, blocksize):
-                i2 = min(i1 + blocksize, columns)
-                count = i2 - i1
+            # Standard conv
+            if X.ndim == 4:
+                kH, kW = mod.kernel_size
+                col = X.shape[1] * kH * kW
+                H_local = torch.zeros(col, col, device=X.device)
+                n_local = 0
+                for b in range(X.shape[0]):
+                    Xb = torch.nn.functional.unfold(
+                        X[b:b + 1],
+                        kernel_size=mod.kernel_size,
+                        stride=mod.stride,
+                        padding=mod.padding,
+                        dilation=mod.dilation,
+                    )                                              # (1, C*k2, L)
+                    Xb = Xb.squeeze(0).t().contiguous()             # (L, C*k2)
+                    H_local.add_(Xb.t() @ Xb)
+                    n_local += Xb.shape[0]
+                    del Xb
+                _accumulate(H_local, n_local)
+                return
 
-                W_block = W[:, i1:i2].clone()
-                Q_block = torch.zeros_like(W_block)
-                Err_block = torch.zeros_like(W_block)
-                Hinv_block = Hinv[i1:i2, i1:i2]
-                mask_block = underflow_mask[:, i1:i2]
+            # Plain Linear
+            _accumulate(X.t() @ X, X.shape[0])
 
-                for j in range(count):
-                    w = W_block[:, j]
-                    d = Hinv_block[j, j]
-                    q = w.clone()
+        h = module.register_forward_pre_hook(hook)
 
-                    # SparseGPT step: force underflowing weights to zero
-                    q[mask_block[:, j]] = 0.0
+        with torch.no_grad():
+            for i in range(0, calib_data.shape[0], micro_batch_size):
+                batch = calib_data[i:i + micro_batch_size].to(device, non_blocking=True)
+                model(batch)
+                del batch
+                if use_cuda:
+                    torch.cuda.empty_cache()
 
-                    # GPTQ step: quantize the surviving (non-underflow) weights
-                    survive = ~mask_block[:, j]
-                    if survive.any():
-                        q[survive] = lof.exp_mant_quantize(
-                            q[survive], exp_bits, mant_bits
-                        )
-
-                    Q_block[:, j] = q
-
-                    # Error compensation (shared by both sparse and quant updates)
-                    err = (w - q) / d
-                    Err_block[:, j] = err
-
-                    # Propagate error to remaining columns in this block
-                    if j + 1 < count:
-                        W_block[:, j + 1:] -= (
-                            err.unsqueeze(1) * Hinv_block[j, j + 1:].unsqueeze(0)
-                        )
-
-                Q[:, i1:i2] = Q_block
-
-                # Propagate error to all remaining columns beyond this block
-                if i2 < columns:
-                    W[:, i2:] -= Err_block @ Hinv[i1:i2, i2:]
-
-            # --- Undo permutation and write back ---
-            Q = Q[:, invperm]
-            if len(orig_shape) == 4:
-                Q = Q.reshape(orig_shape)
-            module.weight.data.copy_(Q)
-
-        return hook
-
-    def delete_activation_hook(layer_name):
-        def hook(module, input, output):
-            captured_activations.pop(layer_name, None)
-            captured_pre_choleskys.pop(layer_name, None)
-        return hook
-
-    # --- Register hooks on all LoF layers ---
-    capture_pre_hooks = [
-        module.register_forward_pre_hook(make_capture_hook(name))
-        for name, module in model.named_modules()
-        if isinstance(module, (LoF_Linear, LoF_Conv2d))
-    ]
-    capture_post_hooks = [
-        module.register_forward_hook(delete_activation_hook(name))
-        for name, module in model.named_modules()
-        if isinstance(module, (LoF_Linear, LoF_Conv2d))
-    ]
-
-    # --- Run calibration data through model (triggers all hooks) ---
-    with torch.no_grad():
-        model(calib_data)
-
-    # --- Clean up hooks ---
-    for h in capture_pre_hooks:
         h.remove()
-    for h in capture_post_hooks:
-        h.remove()
+
+        if hess_state['H_sum'] is None:
+            # Layer was never reached during forward (e.g. dead branch); skip
+            continue
+
+        H = hess_state['H_sum'] / hess_state['n']
+        del hess_state
+
+        # ---------- Phase 2: GPTQ update for this layer ----------
+        exp_bits = exponent_bits[layer_name]
+        mant_bits = mantissa_bits[layer_name]
+        smallest_subnormal = 2 ** (1 - (1 << exp_bits) - mant_bits)
+
+        damp = perturb_ratio * torch.diag(H).mean()
+        H += damp * torch.eye(H.shape[0], device=H.device)
+        perm = torch.argsort(torch.diag(H), descending=True)
+        invperm = torch.argsort(perm)
+
+        W = module.weight.data.clone()
+        underflow_mask = W.abs() < smallest_subnormal
+        orig_shape = W.shape
+
+        if W.ndim == 4:
+            W = W.reshape(W.shape[0], -1)
+            underflow_mask = underflow_mask.reshape(underflow_mask.shape[0], -1)
+
+        columns = W.shape[1]
+        W = W[:, perm]
+        H = H[perm][:, perm]
+        underflow_mask = underflow_mask[:, perm]
+
+        try:
+            H_d = H.double()
+            cho = torch.linalg.cholesky(H_d)
+            H_inv = torch.cholesky_inverse(cho)
+            Hinv = torch.linalg.cholesky(H_inv, upper=True).float()
+            del H_d, cho, H_inv
+        except torch.linalg.LinAlgError:
+            print(f"  [WARN] Cholesky failed for layer {layer_name}, skipping GPTQ (keeping weights as-is)")
+            del H, W, underflow_mask
+            if use_cuda:
+                torch.cuda.empty_cache()
+            continue
+
+        Q = torch.zeros_like(W)
+
+        for i1 in range(0, columns, blocksize):
+            i2 = min(i1 + blocksize, columns)
+            count = i2 - i1
+
+            W_block = W[:, i1:i2].clone()
+            Q_block = torch.zeros_like(W_block)
+            Err_block = torch.zeros_like(W_block)
+            Hinv_block = Hinv[i1:i2, i1:i2]
+            mask_block = underflow_mask[:, i1:i2]
+
+            for j in range(count):
+                w = W_block[:, j]
+                d = Hinv_block[j, j]
+                q = w.clone()
+
+                q[mask_block[:, j]] = 0.0
+                survive = ~mask_block[:, j]
+                if survive.any():
+                    q[survive] = lof.exp_mant_quantize(q[survive], exp_bits, mant_bits)
+
+                Q_block[:, j] = q
+                err = (w - q) / d
+                Err_block[:, j] = err
+
+                if j + 1 < count:
+                    W_block[:, j + 1:] -= err.unsqueeze(1) * Hinv_block[j, j + 1:].unsqueeze(0)
+
+            Q[:, i1:i2] = Q_block
+            if i2 < columns:
+                W[:, i2:] -= Err_block @ Hinv[i1:i2, i2:]
+
+        Q = Q[:, invperm]
+        if len(orig_shape) == 4:
+            Q = Q.reshape(orig_shape)
+        module.weight.data.copy_(Q)
+
+        del W, H, Hinv, Q, underflow_mask
+        if use_cuda:
+            torch.cuda.empty_cache()
 
     return model
+
 
 def sanity_test():
 

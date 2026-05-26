@@ -69,7 +69,7 @@ PASCAL_ROOT = "."
 
 SEARCH_SUBSET_SIZE = 100  # Number of images for eval_fn during greedy search
 
-ACCURACY_TARGETS = [0.1, 0.05]  # Run quantization for each of these targets
+ACCURACY_TARGETS = [0.05, 0.01]  # Run quantization for each of these targets
 
 
 def _update_config(batch_size, img_size, workers, device, search_subset_size, accuracy_targets):
@@ -910,6 +910,7 @@ def run_ultralytics_quantized(model_key, data_yaml, calib_img_path, dataset_name
     def eval_fn(m, data):
         model.model = m.eval().to(device)
         if dataset_name == "pascal":
+            model.predictor = None
             metrics = eval_ultralytics_pascal(model, device, max_images=SEARCH_SUBSET_SIZE, seed=42)
             cur_map = metrics.get("map", 0.0)
         else:
@@ -929,10 +930,18 @@ def run_ultralytics_quantized(model_key, data_yaml, calib_img_path, dataset_name
     if device != 'cpu' and torch.cuda.is_available():
         torch.cuda.empty_cache()
     print(f"  Running greedy_sensitivity quantization search (accuracy_target={accuracy_target}) ...")
-    quantized_inner = ss.greedy_sensitivity(model=inner, sensitivity_measure="hessian",
-        data=dataset, loss_fn=loss_fn, eval_fn=eval_fn, accuracy_target=accuracy_target,
-        bs=[4,3,2], es=[4,3,2], accum_bw=[14,12,10], n_samples=n_samples, device=device, baseline=baseline_score)
-    print(lof.record_formats(quantized_inner))
+    quantized_inner = ss.greedy_sensitivity(
+        model=inner,
+        sensitivity_measure="hessian",
+        data=dataset,
+        loss_fn=loss_fn,
+        eval_fn=eval_fn,
+        accuracy_target=accuracy_target,
+        bs=[6, 5, 4, 3, 2],
+        n_samples=128,
+        device=device,
+    )
+    print(lof.record_formats(quantized_inner, BATCH_SIZE))
     quantized_inner.to(device)
     with torch.no_grad():
         preds = quantized_inner(val_data)
@@ -949,6 +958,7 @@ def run_ultralytics_quantized(model_key, data_yaml, calib_img_path, dataset_name
     model.model = quantized_inner
     t0 = time.time()
     if dataset_name == "pascal":
+        model.predictor = None
         metrics = eval_ultralytics_pascal(model, device)
         print(f"\n  [{model_key}/pascal] Quantized (target={accuracy_target}): {metrics}  ({time.time()-t0:.1f}s)")
         return metrics
@@ -1061,10 +1071,17 @@ def run_torchvision_quantized(model_key, dataset_name, device, accuracy_target=0
                               mode="bilinear", align_corners=False).squeeze(0) for img in images])
         return images, list(labels)
     print(f"  Running greedy_sensitivity quantization search (accuracy_target={accuracy_target}) ...")
-    quantized_model = ss.greedy_sensitivity(model=model, sensitivity_measure="hessian",
-        data=ds, loss_fn=loss_fn, eval_fn=eval_fn, accuracy_target=accuracy_target,
-        bs=[4,3,2], es=[4,3,2,1], accum_bw=[14,12,10], n_samples=n_calib, device=device,
-        collate_fn=tv_collate_fn, baseline=baseline_score)
+    quantized_model = ss.greedy_sensitivity(
+        model=model,
+        sensitivity_measure="hessian",
+        data=ds,
+        loss_fn=loss_fn,
+        eval_fn=eval_fn,
+        accuracy_target=accuracy_target,
+        bs=[6, 5, 4, 3, 2],
+        n_samples=n_calib,
+        device=device,
+    )
     print(lof.record_formats(quantized_model))
     quantized_model.to(device).eval()
     with torch.no_grad():

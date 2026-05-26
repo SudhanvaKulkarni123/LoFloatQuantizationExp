@@ -622,14 +622,35 @@ def greedy_sensitivity(model, sensitivity_measure, data, loss_fn, eval_fn,
     lof_model = lof.lofloatify(model, skip_layer_names=skip_layer_names)
     lof_model.to(device)
 
+    # ── Per-layer weight scales: pick s_w = 1/max(|W|) so STERound sees a
+    # normalized weight; also written into module.w_scale_factor so the
+    # runtime forward / GEMM rescale is consistent.
+    weight_scales = sensitivities.find_weight_scales(lof_model, target_max=1.0)
+    print(f"[greedy] weight scales: {len(weight_scales)} layers, "
+          f"min={min(weight_scales.values()):.3g}, "
+          f"max={max(weight_scales.values()):.3g}")
+
+    # ── Per-layer saturation modes: scan weights/biases/activations for inf;
+    # any layer that sees an inf gets Extended (inf-supporting), others get
+    # Saturating (clamps to max representable). Applied in-place.
+    activ_sat, weight_sat, bias_sat = sensitivities.find_saturation_modes(
+        lof_model, data, n_samples=n_samples, device=device,
+        collate_fn=collate_fn, apply=True,
+    )
+    n_ext_w = sum(1 for v in weight_sat.values() if not v)
+    n_ext_b = sum(1 for v in bias_sat.values() if not v)
+    n_ext_a = sum(1 for v in activ_sat.values() if not v)
+    print(f"[greedy] Extended (inf-supporting) layers — "
+          f"weights: {n_ext_w}, bias: {n_ext_b}, activations: {n_ext_a}")
+
     # ── Apply Hadamard rotation to weights BEFORE calibration / sensitivity.
     # Every remaining LoF layer is rotated (first/last are already excluded
     # by lofloatify above, so skip_first/skip_last are False here). All ranges
     # and sensitivities below are then measured in the rotated basis, and the
     # eval_fn calls during the search run with `hadamard_transform=True` on
     # each layer, so activations get rotated to match the rotated weights.
-    if hadamard:
-        apply_hadamard_to_weights(lof_model, skip_first=False, skip_last=False)
+    # if hadamard:
+    #     apply_hadamard_to_weights(lof_model, skip_first=False, skip_last=False)
 
     with torch.no_grad():
         weights_minmax, activ_minmax, bias_minmax = sensitivities.find_range(
@@ -837,55 +858,51 @@ def greedy_sensitivity(model, sensitivity_measure, data, loss_fn, eval_fn,
 
         ll = ql
 
-    # ======================GPTQ pruning======================
-    # lof_model = sensitivities.quantize_weights_with_gptq(
-    #     model=lof_model, dataset=data, mantissa_bits=w_weights,
-    #     exponent_bits=weights_exp, n_samples=128, device=device, micro_batch_size=4, collate_fn=collate_fn
-    # )
 
-    # ==================== ACCUMULATION SEARCH ====================
-    print("accum sensitivities:")
-    print(accum_sens)
-    ll = [k for k, v in sorted(accum_sens.items(), key=accum_sort_key)]
-    for name, module in lof_model.named_modules():
-        if not isinstance(module, (lof.LoF_Linear, lof.LoF_Conv2d)):
-            continue
-        if name in skip_layers:
-            continue
-        if name not in ll:
-            ll.append(name)
+    # # ==================== ACCUMULATION SEARCH ====================
+    # print("accum sensitivities:")
+    # print(accum_sens)
+    # ll = [k for k, v in sorted(accum_sens.items(), key=accum_sort_key)]
+    # for name, module in lof_model.named_modules():
+    #     if not isinstance(module, (lof.LoF_Linear, lof.LoF_Conv2d)):
+    #         continue
+    #     if name in skip_layers:
+    #         continue
+    #     if name not in ll:
+    #         ll.append(name)
 
-    accum_bw = sorted(accum_bw, reverse=True)
-    for b in accum_bw:
-        ql = []
+    # accum_bw = sorted(accum_bw, reverse=True)
+    # for b in accum_bw:
+    #     ql = []
 
-        for batch in make_batches(ll, batch_size):
-            active_layers = [l for l in batch if l not in skip_layers]
-            if not active_layers:
-                continue
+    #     for batch in make_batches(ll, batch_size):
+    #         active_layers = [l for l in batch if l not in skip_layers]
+    #         if not active_layers:
+    #             continue
 
-            prev = {l: accum_precs[l] for l in active_layers}
+    #         prev = {l: accum_precs[l] for l in active_layers}
 
-            for l in active_layers:
-                accum_precs[l] = b
+    #         for l in active_layers:
+    #             accum_precs[l] = b
 
-            lof.set_accumulation_precisions(lof_model, accum_precs)
-            a = abs(eval_fn(lof_model, data))
+    #         lof.set_accumulation_precisions(lof_model, accum_precs)
+    #         a = abs(eval_fn(lof_model, data))
 
-            if a <= accuracy_target:
-                ql.extend(active_layers)
-            else:
-                for l in active_layers:
-                    accum_precs[l] = prev[l]
+    #         if a <= accuracy_target:
+    #             ql.extend(active_layers)
+    #         else:
+    #             for l in active_layers:
+    #                 accum_precs[l] = prev[l]
 
-        ll = ql
+    #     ll = ql
 
     # ==================== APPLY FINAL CONFIG ====================
     lof_model = lof.lofloatify(model, skip_layer_names=skip_layer_names)
     lof_model = lof_model.to(device)
 
-    if hadamard:
-        apply_hadamard_to_weights(lof_model, skip_first=False, skip_last=False)
+
+    # if hadamard:
+    #     apply_hadamard_to_weights(lof_model, skip_first=False, skip_last=False)
 
     print("running gptq with exp_bits = %d and mantissa_bits = %d" %
           (list(weights_exp.values())[9], list(w_weights.values())[9]))
@@ -910,86 +927,94 @@ def greedy_sensitivity(model, sensitivity_measure, data, loss_fn, eval_fn,
         bias_exp_bits=bias_exp,
     )
 
-    print(accum_precs)
-    lof.set_accumulation_precisions(lof_model, accum_precs)
-    lof_model = lof_model.to(device)
-
-    # ==================== BN + SILU REPLACEMENT ====================
-    L1_s, Linf_s = sensitivities.find_batchnorm_scales(
-        lof_model, data, n_samples, device, collate_fn=collate_fn
+    # ======================GPTQ pruning======================
+    lof_model = sensitivities.quantize_weights_with_gptq(
+        model=lof_model, dataset=data, mantissa_bits=w_weights,
+        exponent_bits=weights_exp, n_samples=128, device=device, micro_batch_size=4, collate_fn=collate_fn
     )
 
-    bn_candidates = [
-        (1.0,      "L1",   {"L1_scales": L1_s, "Linf_scales": Linf_s}),
-        (math.inf, "Linf", {"L1_scales": L1_s, "Linf_scales": Linf_s}),
-        ("fisr",   "FISR", {}),
-        ("pwl",    "PWL",  {"lut_bits": 8, "lut_method": "minimax"}),
-    ]
+    lof_model = lof_model.to(device)
 
-    chosen = None
-    best_acc = float('inf')
-    for p, tag, kwargs in bn_candidates:
-        cand = replace_batchnorm2d(copy.deepcopy(lof_model), p=p, **kwargs)
-        cand = cand.to(device)
-        acc = abs(eval_fn(cand, data))
-        ok = acc <= accuracy_target
-        print(f"{tag} BN replacement: "
-              f"{f'OK acc={acc:.4f}' if ok else f'FAILED acc={acc:.4f}'}")
-        if ok and acc <= best_acc:
-            best_acc = acc
-            chosen = cand
-            chosen_tag = tag
+    # print(accum_precs)
+    # lof.set_accumulation_precisions(lof_model, accum_precs)
+    # lof_model = lof_model.to(device)
 
-    if chosen is not None:
-        print(f"  -> using {chosen_tag} BN replacement (acc={best_acc:.4f})")
+    # # ==================== BN + SILU REPLACEMENT ====================
+    # L1_s, Linf_s = sensitivities.find_batchnorm_scales(
+    #     lof_model, data, n_samples, device, collate_fn=collate_fn
+    # )
 
-    if chosen is None:
-        print("Trying again with higher-precision PWL BN LUT...")
-        cand = replace_batchnorm2d(copy.deepcopy(lof_model), p="pwl", lut_bits=12, lut_method="minimax")
-        cand = cand.to(device)
-        acc = abs(eval_fn(cand, data))
-        if acc <= accuracy_target:
-            print(f"  -> using higher-precision PWL BN replacement (acc={acc:.4f})")
-            chosen = cand
-        else:
-            cand = replace_batchnorm2d(copy.deepcopy(lof_model), p="pwl", lut_bits=16, lut_method="minimax")
-            cand = cand.to(device)
-            acc = abs(eval_fn(cand, data))
-            if acc <= accuracy_target:
-                print(f"  -> using even higher-precision PWL BN replacement (acc={acc:.4f})")
-                chosen = cand
-            else:
-                print(f"  -> higher-precision PWL BN replacement also failed (acc={acc:.4f}), keeping original BN")
+    # bn_candidates = [
+    #     (1.0,      "L1",   {"L1_scales": L1_s, "Linf_scales": Linf_s}),
+    #     (math.inf, "Linf", {"L1_scales": L1_s, "Linf_scales": Linf_s}),
+    #     ("fisr",   "FISR", {}),
+    #     ("pwl",    "PWL",  {"lut_bits": 8, "lut_method": "minimax"}),
+    # ]
 
-    base = chosen if chosen is not None else lof_model
-    base = base.to(device)
+    # chosen = None
+    # best_acc = float('inf')
+    # for p, tag, kwargs in bn_candidates:
+    #     cand = replace_batchnorm2d(copy.deepcopy(lof_model), p=p, **kwargs)
+    #     cand = cand.to(device)
+    #     acc = abs(eval_fn(cand, data))
+    #     ok = acc <= accuracy_target
+    #     print(f"{tag} BN replacement: "
+    #           f"{f'OK acc={acc:.4f}' if ok else f'FAILED acc={acc:.4f}'}")
+    #     if ok and acc <= best_acc:
+    #         best_acc = acc
+    #         chosen = cand
+    #         chosen_tag = tag
 
-    silu_cand = replace_silu(copy.deepcopy(base),
-                             R=8.0, lut_bits=6, lut_method="minimax").to(device)
-    acc = abs(eval_fn(silu_cand, data))
-    if acc <= accuracy_target:
-        print(f"SiLU LUT replacement: OK acc={acc:.4f}")
-        final_model = silu_cand.to(device)
-    else:
-        print(f"SiLU LUT replacement: FAILED acc={acc:.4f}, trying larger LUT")
-        silu_cand = replace_silu(copy.deepcopy(base),
-                                 R=8.0, lut_bits=10, lut_method="minimax").to(device)
-        acc = abs(eval_fn(silu_cand, data))
-        if acc <= accuracy_target:
-            print(f"SiLU LUT replacement with larger LUT: OK acc={acc:.4f}")
-            final_model = silu_cand.to(device)
-        else:
-            print(f"SiLU LUT replacement with larger LUT: FAILED acc={acc:.4f}, increasing LUT size once more")
-            silu_cand = replace_silu(copy.deepcopy(base),
-                                     R=8.0, lut_bits=12, lut_method="minimax").to(device)
-            acc = abs(eval_fn(silu_cand, data))
-            if acc <= accuracy_target:
-                print(f"SiLU LUT replacement with even larger LUT: OK acc={acc:.4f}")
-                final_model = silu_cand.to(device)
-            else:
-                print(f"SiLU LUT replacement with even larger LUT: FAILED acc={acc:.4f}, keeping original SiLU")
-                final_model = base.to(device)
+    # if chosen is not None:
+    #     print(f"  -> using {chosen_tag} BN replacement (acc={best_acc:.4f})")
+
+    # if chosen is None:
+    #     print("Trying again with higher-precision PWL BN LUT...")
+    #     cand = replace_batchnorm2d(copy.deepcopy(lof_model), p="pwl", lut_bits=12, lut_method="minimax")
+    #     cand = cand.to(device)
+    #     acc = abs(eval_fn(cand, data))
+    #     if acc <= accuracy_target:
+    #         print(f"  -> using higher-precision PWL BN replacement (acc={acc:.4f})")
+    #         chosen = cand
+    #     else:
+    #         cand = replace_batchnorm2d(copy.deepcopy(lof_model), p="pwl", lut_bits=16, lut_method="minimax")
+    #         cand = cand.to(device)
+    #         acc = abs(eval_fn(cand, data))
+    #         if acc <= accuracy_target:
+    #             print(f"  -> using even higher-precision PWL BN replacement (acc={acc:.4f})")
+    #             chosen = cand
+    #         else:
+    #             print(f"  -> higher-precision PWL BN replacement also failed (acc={acc:.4f}), keeping original BN")
+
+    # base = chosen if chosen is not None else lof_model
+    # base = base.to(device)
+
+    # silu_cand = replace_silu(copy.deepcopy(base),
+    #                          R=8.0, lut_bits=6, lut_method="minimax").to(device)
+    # acc = abs(eval_fn(silu_cand, data))
+    # if acc <= accuracy_target:
+    #     print(f"SiLU LUT replacement: OK acc={acc:.4f}")
+    #     final_model = silu_cand.to(device)
+    # else:
+    #     print(f"SiLU LUT replacement: FAILED acc={acc:.4f}, trying larger LUT")
+    #     silu_cand = replace_silu(copy.deepcopy(base),
+    #                              R=8.0, lut_bits=10, lut_method="minimax").to(device)
+    #     acc = abs(eval_fn(silu_cand, data))
+    #     if acc <= accuracy_target:
+    #         print(f"SiLU LUT replacement with larger LUT: OK acc={acc:.4f}")
+    #         final_model = silu_cand.to(device)
+    #     else:
+    #         print(f"SiLU LUT replacement with larger LUT: FAILED acc={acc:.4f}, increasing LUT size once more")
+    #         silu_cand = replace_silu(copy.deepcopy(base),
+    #                                  R=8.0, lut_bits=12, lut_method="minimax").to(device)
+    #         acc = abs(eval_fn(silu_cand, data))
+    #         if acc <= accuracy_target:
+    #             print(f"SiLU LUT replacement with even larger LUT: OK acc={acc:.4f}")
+    #             final_model = silu_cand.to(device)
+    #         else:
+    #             print(f"SiLU LUT replacement with even larger LUT: FAILED acc={acc:.4f}, keeping original SiLU")
+    #             final_model = base.to(device)
 
 
-    return final_model
+    return lof_model
 

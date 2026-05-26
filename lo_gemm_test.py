@@ -337,7 +337,14 @@ if __name__ == "__main__":
     A = torch.randn(80, 160, device='cuda')        # non-square M, K
     B = torch.randn(160, 320, device='cuda')       # K, N with K != N
     ref = A @ B
-    got = lof.lof_gemm(A, B.contiguous(), 23, lof.RoundingMode.RoundToNearestEven, 0)
-    print("max abs diff:", (ref - got).abs().max().item())
+    got = lof.lof_gemm(A, B.contiguous(), 22, lof.RoundingMode.RoundToNearestEven, 0)
+    print("max abs diff for fp32:", (ref - got).abs().max().item())
+    A = torch.randn(80, 160, device='cuda', dtype=torch.float16)        # non-square M, K
+    B = torch.randn(160, 320, device='cuda', dtype=torch.float16)       # K, N with K != N
+    ref = A @ B
+    A = A.to(dtype=torch.float32)
+    B = B.to(dtype=torch.float32)
+    got = lof.lof_gemm(A, B.contiguous(), 10, lof.RoundingMode.RoundToNearestEven, 0)
+    print("max abs diff for fp16:", (ref - got).abs().max().item())
     # If this is huge, the transpose bug is real.
 # If you do `B.t().contiguous()` and it matches, bug confirmed.

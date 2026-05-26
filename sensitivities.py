@@ -160,6 +160,106 @@ def find_exp_bits_and_bias(weights_minmax, activations_minmax, bias_minmax):
         bias_bias[name] = 0
 
     return weights_exp_bits, weights_bias, activations_exp_bits, activations_bias, bias_exp_bits, bias_bias
+
+
+def find_saturation_modes(model, dataset, n_samples=256, device='cuda',
+                          collate_fn=None, chunk_size=32, apply=True):
+    """Per-layer saturation-mode picker.
+
+    Scans weights, biases, and observed activations of every LoF_Linear /
+    LoF_Conv2d. If any +/-inf is seen in a tensor, that operand needs the
+    Extended (inf-supporting) format; otherwise we pick Saturating (clamps to
+    max representable, no inf).
+
+    Returns three {layer_name: bool} dicts (activ_sat, weight_sat, bias_sat),
+    where True = Saturating, False = Extended -- matching the convention of
+    layers.set_saturation_mode(activ_sat, weight_sat, bias_sat).
+
+    If `apply=True`, also pushes the result through
+    lof.set_saturation_modes(model, ...).
+    """
+    model.eval()
+
+    act_has_inf = {}
+
+    def make_hook(layer_name):
+        def hook(module, inp, out):
+            x = inp[0].detach()
+            seen = bool(torch.isinf(x).any().item())
+            act_has_inf[layer_name] = act_has_inf.get(layer_name, False) or seen
+        return hook
+
+    hooks = [
+        module.register_forward_hook(make_hook(name))
+        for name, module in model.named_modules()
+        if isinstance(module, (LoF_Linear, LoF_Conv2d))
+    ]
+
+    calib_data_cpu = make_calib_data(
+        dataset=dataset, n_samples=n_samples, collate_fn=collate_fn
+    )
+
+    with torch.no_grad():
+        for i in range(0, n_samples, chunk_size):
+            chunk = calib_data_cpu[i:i+chunk_size].to(device, non_blocking=True)
+            model(chunk)
+            del chunk
+            if device != 'cpu' and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    for h in hooks:
+        h.remove()
+
+    activ_sat, weight_sat, bias_sat = {}, {}, {}
+    for name, module in model.named_modules():
+        if not isinstance(module, (LoF_Linear, LoF_Conv2d)):
+            continue
+
+        w_inf = bool(torch.isinf(module.weight.detach()).any().item())
+        b_inf = (bool(torch.isinf(module.bias.detach()).any().item())
+                 if module.bias is not None else False)
+        a_inf = act_has_inf.get(name, False)
+
+        # True = Saturating (no inf seen), False = Extended (inf support needed)
+        weight_sat[name] = not w_inf
+        bias_sat[name]   = not b_inf
+        activ_sat[name]  = not a_inf
+
+    if apply:
+        lof.set_saturation_modes(model, activ_sat, weight_sat, bias_sat)
+
+    return activ_sat, weight_sat, bias_sat
+
+
+def find_weight_scales(model, target_max=1.0):
+    """Per-layer weight scale factors.
+
+    For each LoF_Linear / LoF_Conv2d, computes
+        s = target_max / max(|W|)
+    and writes it to module.w_scale_factor. The runtime forward path then
+    does round(s * W, weight_params) and the GEMM divides by s_a * s_w to
+    rescale, so picking s such that s * max(|W|) = target_max maps the
+    largest weight onto the format's `target_max` representable value.
+
+    Default target_max=1.0 normalizes max(|W|) -> 1.0. Pass the format's
+    actual max representable value (e.g. ~240 for P3109 b8/m4 saturating)
+    to use the full dynamic range.
+
+    Returns a {layer_name: scale} dict ready to feed into
+    quantize_weights_with_gptq(weight_scales=...).
+    """
+    scales = {}
+    for name, module in model.named_modules():
+        if not isinstance(module, (LoF_Linear, LoF_Conv2d)):
+            continue
+        with torch.no_grad():
+            w_max = module.weight.detach().abs().max().item()
+        s = (target_max / w_max) if w_max > 0 else 1.0
+        module.w_scale_factor = float(s)
+        scales[name] = float(s)
+    return scales
+
+
 def find_batchnorm_scales(model, dataset, n_samples=256, device='cuda',
                           collate_fn=None, chunk_size=32,
                           linf_quantile=0.999):
@@ -472,6 +572,7 @@ def quantize_weights_with_gptq(
     perturb_ratio=0.01,
     collate_fn=None,
     micro_batch_size=4,
+    weight_scales=None,
 ):
     """
     Memory-efficient sequential GPTQ for LoF layers.
@@ -601,12 +702,21 @@ def quantize_weights_with_gptq(
         mant_bits = mantissa_bits[layer_name]
         smallest_subnormal = 2 ** (1 - (1 << exp_bits) - mant_bits)
 
+        # Per-layer weight scale: GPTQ runs in the scaled domain so the
+        # quantization error fed back through H matches what the runtime
+        # STERound (round(s*W, params)) will see. Final weight is descaled
+        # before being written back so the layer's GEMM rescale (divide by
+        # s_a*s_w) recovers the right numeric range.
+        s = float(weight_scales[layer_name]) if weight_scales is not None else 1.0
+
         damp = perturb_ratio * torch.diag(H).mean()
         H += damp * torch.eye(H.shape[0], device=H.device)
         perm = torch.argsort(torch.diag(H), descending=True)
         invperm = torch.argsort(perm)
 
         W = module.weight.data.clone()
+        if s != 1.0:
+            W.mul_(s)
         underflow_mask = W.abs() < smallest_subnormal
         orig_shape = W.shape
 
@@ -666,6 +776,8 @@ def quantize_weights_with_gptq(
                 W[:, i2:] -= Err_block @ Hinv[i1:i2, i2:]
 
         Q = Q[:, invperm]
+        if s != 1.0:
+            Q.div_(s)
         if len(orig_shape) == 4:
             Q = Q.reshape(orig_shape)
         module.weight.data.copy_(Q)

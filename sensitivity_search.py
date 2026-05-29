@@ -845,6 +845,7 @@ def greedy_sensitivity(model, sensitivity_measure, data, loss_fn, eval_fn,
                                     activation_exp_bits=activ_exp,
                                     weight_exp_bits=weights_exp,
                                     bias_exp_bits=bias_exp)
+            scales = sensitivities.find_weight_scales()
             a = abs(eval_fn(lof_model, data))
 
             if a <= accuracy_target:

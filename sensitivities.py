@@ -255,9 +255,16 @@ def find_weight_scales(model, target_max=1.0):
         with torch.no_grad():
             w_max = module.weight.detach().abs().max().item()
         s = (target_max / w_max) if w_max > 0 else 1.0
-        module.w_scale_factor = float(s)
         scales[name] = float(s)
     return scales
+
+def set_weight_scales(model, weight_scales):
+    for name, module in model.named_modules():
+        if not isinstance(module, (LoF_Linear, LoF_Conv2d)):
+            continue
+        else:
+            s = float(weight_scales[name])
+            module.w_scale_factor = s
 
 
 def find_batchnorm_scales(model, dataset, n_samples=256, device='cuda',

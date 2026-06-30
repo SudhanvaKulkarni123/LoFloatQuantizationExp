@@ -219,6 +219,7 @@ def bisection_sensitivity(model, sensitivity_measure, data, loss_fn, eval_fn,
         weights_minmax, activ_minmax, bias_minmax = sensitivities.find_range(lof_model, data, n_samples, device, collate_fn=collate_fn)
         weights_exp, weights_bias, activ_exp, activ_bias, bias_exp, bias_bias = sensitivities.find_exp_bits_and_bias(weights_minmax, activ_minmax, bias_minmax)
 
+
     # Sensitivity analysis
     if sensitivity_measure == "hessian":
         weight_sens, activ_sens, bias_sens = sensitivities.hess_sensitivity(lof_model, data, n_samples, device, collate_fn=collate_fn)
@@ -638,6 +639,9 @@ def greedy_sensitivity(model, sensitivity_measure, data, loss_fn, eval_fn,
         weights_exp, weights_bias, activ_exp, activ_bias, bias_exp, bias_bias = \
             sensitivities.find_exp_bits_and_bias(weights_minmax, activ_minmax, bias_minmax)
 
+    print("minmax for weights:")
+    for name, (min_val, max_val) in weights_minmax.items():
+        print(f"  {name}: [{min_val}, {max_val}]")
     # if sensitivity_measure == "hessian":
     #     weight_sens, activ_sens, bias_sens, accum_sens = sensitivities.hess_sensitivity(
     #         lof_model, data, n_samples, device, collate_fn=collate_fn
@@ -729,6 +733,44 @@ def greedy_sensitivity(model, sensitivity_measure, data, loss_fn, eval_fn,
         if bsz <= 1:
             return [[layer] for layer in layer_list]
         return [layer_list[i:i + bsz] for i in range(0, len(layer_list), bsz)]
+
+    # ==================== ACCUMULATION SEARCH ====================
+    print("accum sensitivities:")
+    print(accum_sens)
+    ll = [k for k, v in sorted(accum_sens.items(), key=accum_sort_key)]
+    for name, module in lof_model.named_modules():
+        if not isinstance(module, (lof.LoF_Linear, lof.LoF_Conv2d)):
+            continue
+        if name in skip_layers:
+            continue
+        if name not in ll:
+            ll.append(name)
+
+    accum_bw = sorted(accum_bw, reverse=True)
+    for b in accum_bw:
+        ql = []
+
+        for batch in make_batches(ll, batch_size):
+            active_layers = [l for l in batch if l not in skip_layers]
+            if not active_layers:
+                continue
+
+            prev = {l: accum_precs[l] for l in active_layers}
+
+            for l in active_layers:
+                accum_precs[l] = b
+
+            lof.set_accumulation_precisions(lof_model, accum_precs)
+            a = abs(eval_fn(lof_model, data))
+
+            if a <= accuracy_target:
+                ql.extend(active_layers)
+            else:
+                for l in active_layers:
+                    accum_precs[l] = prev[l]
+
+        ll = ql
+
 
     # ==================== MANTISSA SEARCH ====================
     for b in bs:
@@ -843,43 +885,7 @@ def greedy_sensitivity(model, sensitivity_measure, data, loss_fn, eval_fn,
     #     exponent_bits=weights_exp, n_samples=128, device=device, micro_batch_size=4, collate_fn=collate_fn
     # )
 
-    # ==================== ACCUMULATION SEARCH ====================
-    print("accum sensitivities:")
-    print(accum_sens)
-    ll = [k for k, v in sorted(accum_sens.items(), key=accum_sort_key)]
-    for name, module in lof_model.named_modules():
-        if not isinstance(module, (lof.LoF_Linear, lof.LoF_Conv2d)):
-            continue
-        if name in skip_layers:
-            continue
-        if name not in ll:
-            ll.append(name)
-
-    accum_bw = sorted(accum_bw, reverse=True)
-    for b in accum_bw:
-        ql = []
-
-        for batch in make_batches(ll, batch_size):
-            active_layers = [l for l in batch if l not in skip_layers]
-            if not active_layers:
-                continue
-
-            prev = {l: accum_precs[l] for l in active_layers}
-
-            for l in active_layers:
-                accum_precs[l] = b
-
-            lof.set_accumulation_precisions(lof_model, accum_precs)
-            a = abs(eval_fn(lof_model, data))
-
-            if a <= accuracy_target:
-                ql.extend(active_layers)
-            else:
-                for l in active_layers:
-                    accum_precs[l] = prev[l]
-
-        ll = ql
-
+    
     # ==================== APPLY FINAL CONFIG ====================
     lof_model = lof.lofloatify(model, skip_layer_names=skip_layer_names)
     lof_model = lof_model.to(device)

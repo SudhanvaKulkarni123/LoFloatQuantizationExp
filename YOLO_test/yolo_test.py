@@ -7,7 +7,7 @@ edge-oriented detection networks, evaluated on COCO val2017 and/or Pascal VOC 20
 Supported models:
   - yolov8n          (Ultralytics)
   - yolo26n          (Ultralytics)
-  - rtdetr-n         (Ultralytics, RT-DETR small)
+  - rtdetr-l         (Ultralytics, RT-DETR small)
   - mobilenet_ssd_v2 (torchvision SSDLite320 + MobileNetV3-Large)
   - fasterrcnn_mobilenet (torchvision Faster R-CNN + MobileNetV3-Large-FPN, optional)
   - deimv2_dinov3_s  (DEIMv2-S with DINOv3 ViT-S backbone, ~9.7M params, 50.9 AP on COCO)
@@ -17,7 +17,7 @@ Supported datasets:
   - pascal  (VOC2012 val, ~5.8 k images, 20 classes)
 
 Usage:
-  python obj_det_quant_bench.py --models yolov8n yolo26n mobilenet_ssd_v2 rtdetr-n deimv2_dinov3_s \
+  python obj_det_quant_bench.py --models yolov8n yolo26n mobilenet_ssd_v2 rtdetr-l deimv2_dinov3_s \
                                 --datasets coco pascal \
                                 --device cuda --batch-size 16
 """
@@ -502,7 +502,7 @@ def _build_pascal_coco_gt(eval_indices=None):
             ann_id += 1
     categories = [{"id": i+1, "name": c} for i, c in enumerate(PASCAL_CLASS_NAMES)]
     coco_dict = {"images": images, "annotations": annotations, "categories": categories}
-    json_path = os.path.join(PASCAL_ROOT, "_pascal_coco_gt_temp.json")
+    json_path = os.path.join(PASCAL_ROOT, f"_pascal_coco_gt_temp_{os.getpid()}.json")
     with open(json_path, "w") as f:
         json.dump(coco_dict, f)
     coco_gt = COCOGT(json_path)
@@ -758,7 +758,7 @@ def eval_deimv2_pascal(model, device, target_size=640, max_images=None, seed=42)
 # ===================================================================
 def load_ultralytics_model(model_key):
     from ultralytics import YOLO
-    name_map = {"yolov8n": "yolov8n.pt", "yolo26n": "yolo26n.pt", "rtdetr-n": "rtdetr-l.pt"}
+    name_map = {"yolov8n": "yolov8n.pt", "yolo26n": "yolo26n.pt", "rtdetr-l": "rtdetr-l.pt"}
     pt_name = name_map.get(model_key, model_key + ".pt")
     print(f"  Loading Ultralytics model: {pt_name}")
     model = YOLO(pt_name)
@@ -776,7 +776,7 @@ def load_torchvision_model(model_key, device):
     model.eval(); model.to(device)
     return model
 
-ULTRALYTICS_MODELS = {"yolov8n", "yolo26n", "rtdetr-n"}
+ULTRALYTICS_MODELS = {"yolov8n", "yolo26n", "rtdetr-l"}
 TORCHVISION_MODELS = {"mobilenet_ssd_v2", "fasterrcnn_mobilenet"}
 DEIMV2_MODELS      = {"deimv2_dinov3_s"}
 ALL_MODELS = ULTRALYTICS_MODELS | TORCHVISION_MODELS | DEIMV2_MODELS
@@ -931,7 +931,7 @@ def run_ultralytics_quantized(model_key, data_yaml, calib_img_path, dataset_name
     print(f"  Running greedy_sensitivity quantization search (accuracy_target={accuracy_target}) ...")
     quantized_inner = ss.greedy_sensitivity(model=inner, sensitivity_measure="hessian",
         data=dataset, loss_fn=loss_fn, eval_fn=eval_fn, accuracy_target=accuracy_target,
-        bs=[4,3,2], es=[4,3,2], accum_bw=[14,12,10], n_samples=n_samples, device=device, baseline=baseline_score)
+        bs=[4,3,2], es=[4,3,2], accum_bw=[23,20,16,14,12,10], n_samples=n_samples, device=device, baseline=baseline_score)
     print(lof.record_formats(quantized_inner))
     quantized_inner.to(device)
     with torch.no_grad():
@@ -1063,7 +1063,7 @@ def run_torchvision_quantized(model_key, dataset_name, device, accuracy_target=0
     print(f"  Running greedy_sensitivity quantization search (accuracy_target={accuracy_target}) ...")
     quantized_model = ss.greedy_sensitivity(model=model, sensitivity_measure="hessian",
         data=ds, loss_fn=loss_fn, eval_fn=eval_fn, accuracy_target=accuracy_target,
-        bs=[4,3,2], es=[4,3,2,1], accum_bw=[14,12,10], n_samples=n_calib, device=device,
+        bs=[4,3,2], es=[4,3,2,1], accum_bw=[23,20,16,14,12,10], n_samples=n_calib, device=device,
         collate_fn=tv_collate_fn, baseline=baseline_score)
     print(lof.record_formats(quantized_model))
     quantized_model.to(device).eval()
@@ -1263,7 +1263,7 @@ def run_deimv2_quantized(dataset_name, device, accuracy_target=0.01):
     quantized_wrapped = ss.greedy_sensitivity(
         model=wrapped_model, sensitivity_measure="hessian", data=calib_ds,
         loss_fn=loss_fn, eval_fn=eval_fn, accuracy_target=accuracy_target,
-        bs=[4,3,2], es=[4,3,2,1], accum_bw=[14,12,10], n_samples=n_calib, device=device, baseline=baseline_score)
+        bs=[4,3,2], es=[4,3,2,1], accum_bw=[23,20,16,14,12,10], n_samples=n_calib, device=device, baseline=baseline_score)
 
     print(lof.record_formats(quantized_wrapped))
     quantized_wrapped.to(device).eval()
@@ -1305,7 +1305,7 @@ def print_summary(all_results):
 def main():
     parser = argparse.ArgumentParser(description="Object Detection Quantization Benchmark")
     parser.add_argument("--models", nargs="+",
-                        default=["yolov8n", "yolo26n", "mobilenet_ssd_v2", "rtdetr-n", "deimv2_dinov3_s"],
+                        default=["yolov8n", "yolo26n", "mobilenet_ssd_v2", "rtdetr-l", "deimv2_dinov3_s"],
                         choices=sorted(ALL_MODELS))
     parser.add_argument("--datasets", nargs="+", default=["coco"], choices=["coco", "pascal"])
     parser.add_argument("--device", default=DEVICE)

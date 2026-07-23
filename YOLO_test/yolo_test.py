@@ -931,7 +931,7 @@ def run_ultralytics_quantized(model_key, data_yaml, calib_img_path, dataset_name
     print(f"  Running greedy_sensitivity quantization search (accuracy_target={accuracy_target}) ...")
     quantized_inner = ss.greedy_sensitivity(model=inner, sensitivity_measure="hessian",
         data=dataset, loss_fn=loss_fn, eval_fn=eval_fn, accuracy_target=accuracy_target,
-        bs=[4,3,2], es=[4,3,2], accum_bw=[23,20,16,14,12,10], n_samples=n_samples, device=device, baseline=baseline_score)
+        bs=[4,3,2], es=[4,3,2,1], accum_bw=[23], scale_target=8.0, tile_mode='uniform', tile_criterion='frob', frob_tau=0.01, strassen_max_hooks=0, n_samples=n_samples, device=device, baseline=baseline_score)
     print(lof.record_formats(quantized_inner))
     quantized_inner.to(device)
     with torch.no_grad():
